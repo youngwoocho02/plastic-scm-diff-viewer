@@ -1,0 +1,113 @@
+{
+  "name": "plastic-scm-diff-viewer",
+  "displayName": "Plastic SCM Diff Viewer",
+  "description": "Multi-file diff viewer for Plastic SCM (Unity Version Control) — view all changes in a single scrollable diff editor",
+  "version": "0.1.0",
+  "publisher": "fedtop",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/youngwoocho02/plastic-scm-diff-viewer.git"
+  },
+  "homepage": "https://github.com/youngwoocho02/plastic-scm-diff-viewer#readme",
+  "bugs": {
+    "url": "https://github.com/youngwoocho02/plastic-scm-diff-viewer/issues"
+  },
+  "keywords": [
+    "plastic",
+    "plastic-scm",
+    "unity",
+    "unity-version-control",
+    "scm",
+    "vcs",
+    "diff",
+    "multi-diff"
+  ],
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": [
+    "SCM Providers"
+  ],
+  "activationEvents": [
+    "workspaceContains:.plastic",
+    "workspaceContains:**/.plastic"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "plasticDiff.viewAllChanges",
+        "title": "View All Changes (Multi Diff)",
+        "category": "Plastic SCM",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "plasticDiff.viewChangesetDiff",
+        "title": "View Changeset Diff",
+        "category": "Plastic SCM",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "plasticDiff.refresh",
+        "title": "Refresh",
+        "category": "Plastic SCM",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "plasticDiff.clearCache",
+        "title": "Clear Content Cache",
+        "category": "Plastic SCM"
+      }
+    ],
+    "menus": {
+      "scm/title": [
+        {
+          "command": "plasticDiff.viewAllChanges",
+          "group": "navigation",
+          "when": "scmProvider == plastic"
+        },
+        {
+          "command": "plasticDiff.refresh",
+          "group": "navigation",
+          "when": "scmProvider == plastic"
+        }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "plasticDiff.viewAllChanges",
+          "group": "inline@1",
+          "when": "scmProvider == plastic"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Plastic SCM Diff Viewer",
+      "properties": {
+        "plasticDiff.cmPath": {
+          "type": "string",
+          "default": "cm",
+          "description": "Path to the Plastic SCM 'cm' CLI executable"
+        },
+        "plasticDiff.autoRefreshInterval": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "description": "Auto-refresh interval in milliseconds (0 to disable). Warm refresh takes ~6s due to Plastic cm status calls; intervals below ~8s cause refreshes to queue."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run build -- --watch",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.86.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0",
+    "vscode-uri": "^3.1.0"
+  }
+}

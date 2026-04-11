@@ -1,0 +1,415 @@
+import * as vscode from 'vscode';
+import * as path from 'path';
+import { ChangeStatus, EMPTY_REF, PlasticChange, toPlasticUri } from './types';
+import {
+  getPendingChangesRaw,
+  filterPhantomChanges,
+  getWorkspaceInfo,
+  getChangesetDiff,
+  clearContentCache,
+  prefetchBaseContent,
+  logDiag,
+} from './plasticCli';
+import { PlasticContentProvider } from './contentProvider';
+
+interface DiffUris {
+  originalUri: vscode.Uri;
+  modifiedUri: vscode.Uri;
+}
+
+/** SourceControlResourceState extended with the proposed multi-diff fields. */
+type MultiDiffResourceState = vscode.SourceControlResourceState & {
+  multiDiffEditorOriginalUri?: vscode.Uri;
+  multiFileDiffEditorModifiedUri?: vscode.Uri;
+};
+
+/**
+ * Read-only Plastic SCM integration: shows pending changes in the SCM view
+ * and provides Git-style diffs (single-click + multi-diff editor).
+ *
+ * Data source is `cm diff cs:<loaded>` (real content diffs only) — Plastic's
+ * `cm status` is NOT used for the change list because it reports phantom CH
+ * for byte-identical files.
+ */
+export class PlasticScmProvider implements vscode.Disposable {
+  private readonly disposables: vscode.Disposable[] = [];
+  private readonly sourceControl: vscode.SourceControl;
+  private readonly changesGroup: vscode.SourceControlResourceGroup;
+  private readonly contentProvider: PlasticContentProvider;
+  private refreshTimer: ReturnType<typeof setInterval> | undefined;
+  private refreshInflight: Promise<void> | undefined;
+
+  /** Set while Stage 2 (phantom filter) is still running. viewAllChanges
+   *  awaits this so Multi Diff never opens with phantom files included. */
+  private phantomInflight: Promise<void> | undefined;
+
+  /** Most recent fetch result — reused by viewAllChanges.
+   *  All fields are swapped together so viewAllChanges can never read
+   *  an old baseCs with new changes. `phantomFiltered` distinguishes a
+   *  Stage 1 commit (raw, phantoms included) from a Stage 2 commit. */
+  private lastSnapshot: {
+    changes: PlasticChange[];
+    baseCs: number;
+    branch: string;
+    time: number;
+    phantomFiltered: boolean;
+  } = { changes: [], baseCs: 0, branch: '', time: 0, phantomFiltered: false };
+
+  constructor(
+    private readonly workspaceRoot: string,
+    private readonly context: vscode.ExtensionContext
+  ) {
+    this.sourceControl = vscode.scm.createSourceControl(
+      'plastic',
+      'Plastic SCM',
+      vscode.Uri.file(workspaceRoot)
+    );
+    this.sourceControl.acceptInputCommand = undefined as any;
+    this.sourceControl.inputBox.visible = false;
+    this.disposables.push(this.sourceControl);
+
+    this.changesGroup = this.sourceControl.createResourceGroup('changes', 'Changes');
+    this.changesGroup.hideWhenEmpty = true;
+    this.disposables.push(this.changesGroup);
+
+    this.contentProvider = new PlasticContentProvider(workspaceRoot);
+    this.disposables.push(
+      vscode.workspace.registerTextDocumentContentProvider('plastic', this.contentProvider)
+    );
+
+    this.disposables.push(
+      vscode.commands.registerCommand('plasticDiff.viewAllChanges', () => this.viewAllChanges()),
+      vscode.commands.registerCommand('plasticDiff.viewChangesetDiff', () => this.viewChangesetDiff()),
+      vscode.commands.registerCommand('plasticDiff.refresh', () => this.refresh()),
+      vscode.commands.registerCommand('plasticDiff.clearCache', () => {
+        clearContentCache();
+        vscode.window.showInformationMessage('Plastic SCM: content cache cleared.');
+      }),
+    );
+
+    this.setupAutoRefresh();
+    this.disposables.push(
+      vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('plasticDiff.autoRefreshInterval')) {
+          this.setupAutoRefresh();
+        }
+      })
+    );
+
+    this.refresh();
+  }
+
+  private setupAutoRefresh(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
+    const interval = vscode.workspace
+      .getConfiguration('plasticDiff')
+      .get<number>('autoRefreshInterval', 10000);
+    if (interval > 0) {
+      this.refreshTimer = setInterval(() => this.refresh(), interval);
+    }
+  }
+
+  /** Single-flight refresh — concurrent callers share the in-flight promise. */
+  async refresh(): Promise<void> {
+    if (this.refreshInflight) {
+      logDiag(`[refresh] join inflight`);
+      return this.refreshInflight;
+    }
+    logDiag(`[refresh] ──── begin ────`);
+    this.refreshInflight = this.doRefresh().finally(() => {
+      this.refreshInflight = undefined;
+    });
+    return this.refreshInflight;
+  }
+
+  /**
+   * Refresh stages:
+   *   0. info (~2s cold)          — workspace info (cs + branch)
+   *   1. status (~4s cold)         — raw parse, commit snapshot (phantoms included)
+   *   2+3 parallel (~18s cold)     — phantom filter + prefetch concurrently
+   *        - Phantom filter drops byte-identical entries; commit filtered snapshot.
+   *        - Prefetch warms base content for every non-Added item.
+   *        - Both share the same cm semaphore + `_inflight` cache, so Changed
+   *          items fetched by the phantom filter are naturally shared with
+   *          prefetch via in-flight coalescing (no duplicate cm cat).
+   *
+   * Running 2+3 in parallel reduces cold refresh from ~28s to ~20s.
+   */
+  private async doRefresh(): Promise<void> {
+    const t0 = Date.now();
+    try {
+      // Stage 0: workspace info (branch + cs)
+      const tInfoStart = Date.now();
+      const info = await getWorkspaceInfo(this.workspaceRoot);
+      logDiag(`[refresh] stage0 info: ${Date.now() - tInfoStart}ms (cs=${info?.changeset} branch=${info?.branch})`);
+      const baseCs = info?.changeset ?? 0;
+      const branch = info?.branch ?? '';
+
+      // Stage 1: raw pending changes (phantoms included) — commit immediately
+      // with phantomFiltered=false so viewAllChanges knows to wait.
+      const tRawStart = Date.now();
+      const raw = await getPendingChangesRaw(this.workspaceRoot, baseCs);
+      logDiag(`[refresh] stage1 raw status: ${Date.now() - tRawStart}ms (${raw.length} items, phantoms included)`);
+      this.commitSnapshot(raw, baseCs, branch, false);
+
+      // Stage 2 + 3 in parallel:
+      //   - Phantom filter: drop byte-identical Changed → recommit snapshot
+      //   - Prefetch:       warm base content for all non-Added
+      // Both go through the same semaphore; Changed items fetched by phantom
+      // are shared with prefetch via in-flight coalescing.
+      const tWarmStart = Date.now();
+
+      // Track phantom separately so viewAllChanges can await JUST the phantom
+      // stage (which determines correctness of the change list) without having
+      // to also wait for prefetch (which only affects cache warmth).
+      const phantomPromise = (async () => {
+        const tStart = Date.now();
+        const filtered = await filterPhantomChanges(this.workspaceRoot, baseCs, raw);
+        logDiag(`[refresh] phantom: ${Date.now() - tStart}ms (${filtered.length} kept, ${raw.length - filtered.length} dropped)`);
+        this.commitSnapshot(filtered, baseCs, branch, true);
+      })();
+      this.phantomInflight = phantomPromise.finally(() => {
+        this.phantomInflight = undefined;
+      });
+
+      const prefetchPromise = (async () => {
+        const tStart = Date.now();
+        // Pass `raw`, not filtered — phantom filter runs in parallel so the
+        // filtered list isn't available yet. For Changed items, catCached will
+        // hit the in-flight Promise from phantom filter (no duplicate fetch).
+        await prefetchBaseContent(this.workspaceRoot, baseCs, raw);
+        logDiag(`[refresh] prefetch: ${Date.now() - tStart}ms`);
+      })();
+
+      await Promise.all([phantomPromise, prefetchPromise]);
+      logDiag(`[refresh] stage2+3 parallel: ${Date.now() - tWarmStart}ms`);
+
+      logDiag(`[refresh] ──── done in ${Date.now() - t0}ms ────`);
+    } catch (err: any) {
+      logDiag(`[refresh] FAIL: ${err.message}`);
+      console.error('[PlasticDiff]', err.message);
+    }
+  }
+
+  /** Atomic snapshot commit + SCM UI update. */
+  private commitSnapshot(
+    changes: PlasticChange[],
+    baseCs: number,
+    branch: string,
+    phantomFiltered: boolean,
+  ): void {
+    this.lastSnapshot = { changes, baseCs, branch, time: Date.now(), phantomFiltered };
+    this.changesGroup.resourceStates = changes.map(c => this.toResourceState(c, baseCs));
+    this.sourceControl.count = changes.length;
+    logDiag(`[refresh] committed snapshot: ${changes.length} items baseCs=${baseCs} filtered=${phantomFiltered}`);
+  }
+
+  // ---------- Path / URI helpers ----------
+
+  private absOf(p: string): string {
+    return path.isAbsolute(p) ? p : path.join(this.workspaceRoot, p);
+  }
+
+  /**
+   * Build (originalUri, modifiedUri) for a change.
+   *
+   * @param originalRef   Revision spec for the "before" side (e.g. "cs:42").
+   * @param modifiedRef   Revision spec for the "after" side, or `null` to use
+   *                      the live workspace file (pending-change view).
+   *
+   * Semantics mirror Git:
+   *   Added    → EMPTY ← modified
+   *   Deleted  → original ← EMPTY
+   *   Changed  → original ← modified
+   *   Moved    → original@oldPath ← modified@newPath
+   */
+  private diffUris(
+    change: PlasticChange,
+    originalRef: string,
+    modifiedRef: string | null,
+  ): DiffUris {
+    const absPath = this.absOf(change.path);
+    const oldAbs = change.oldPath ? this.absOf(change.oldPath) : absPath;
+
+    const originalUri = change.status === ChangeStatus.Added
+      ? toPlasticUri(absPath, EMPTY_REF)
+      : toPlasticUri(oldAbs, originalRef);
+
+    const modifiedUri = change.status === ChangeStatus.Deleted
+      ? toPlasticUri(absPath, EMPTY_REF)
+      : (modifiedRef === null
+          ? vscode.Uri.file(absPath)
+          : toPlasticUri(absPath, modifiedRef));
+
+    return { originalUri, modifiedUri };
+  }
+
+  private diffTitle(change: PlasticChange, absPath: string): string {
+    const base = path.basename(absPath);
+    switch (change.status) {
+      case ChangeStatus.Added:   return `${base} (Added)`;
+      case ChangeStatus.Deleted: return `${base} (Deleted)`;
+      case ChangeStatus.Moved:   return `${base} (Moved)`;
+      default:                   return `${base} (Plastic SCM)`;
+    }
+  }
+
+  // ---------- Resource state (single-click SCM list) ----------
+
+  private toResourceState(change: PlasticChange, baseCs: number): MultiDiffResourceState {
+    const absPath = this.absOf(change.path);
+    const resourceUri = vscode.Uri.file(absPath);
+    const { originalUri, modifiedUri } = this.diffUris(change, `cs:${baseCs}`, null);
+
+    return {
+      resourceUri,
+      decorations: {
+        strikeThrough: change.status === ChangeStatus.Deleted,
+        tooltip: this.statusLabel(change.status),
+        iconPath: this.statusIcon(change.status),
+      },
+      command: {
+        title: 'Open Diff',
+        command: 'vscode.diff',
+        arguments: [originalUri, modifiedUri, this.diffTitle(change, absPath)],
+      },
+      // Proposed multi-diff API — available on recent VSCode versions
+      multiDiffEditorOriginalUri: originalUri,
+      multiFileDiffEditorModifiedUri: modifiedUri,
+    };
+  }
+
+  // ---------- Commands ----------
+
+  /** Open Multi Diff Editor showing all pending changes. */
+  async viewAllChanges(): Promise<void> {
+    const t0 = Date.now();
+    logDiag(`[scm] ──── viewAllChanges begin ────`);
+
+    // If no snapshot exists yet (first activation before any refresh finished),
+    // force an initial refresh so we have something to show.
+    if (this.lastSnapshot.time === 0) {
+      logDiag(`[scm] no snapshot yet — forcing initial refresh`);
+      await this.refresh();
+    }
+
+    // If the current snapshot is still the raw Stage 1 commit (phantoms included),
+    // wait for phantom filter to finish so Multi Diff opens with correct items.
+    // Prefetch is intentionally NOT awaited — in-flight coalescing handles it.
+    if (!this.lastSnapshot.phantomFiltered && this.phantomInflight) {
+      logDiag(`[scm] snapshot not yet phantom-filtered — awaiting phantom stage`);
+      const tWait = Date.now();
+      await this.phantomInflight;
+      logDiag(`[scm] phantom wait: ${Date.now() - tWait}ms`);
+    }
+
+    // Snapshot read once; subsequent writes by prefetch won't affect us.
+    const snap = this.lastSnapshot;
+    const tRefresh = Date.now();
+
+    if (snap.changes.length === 0) {
+      logDiag(`[scm] no changes — aborting`);
+      vscode.window.showInformationMessage('Plastic SCM: No changes found.');
+      return;
+    }
+
+    const byStatus = { A: 0, C: 0, D: 0, M: 0 };
+    for (const c of snap.changes) byStatus[c.status]++;
+    logDiag(
+      `[scm] using snapshot: ${snap.changes.length} files ` +
+      `(A=${byStatus.A} C=${byStatus.C} D=${byStatus.D} M=${byStatus.M}) baseCs=${snap.baseCs}`
+    );
+
+    const resources = snap.changes.map(c =>
+      this.diffUris(c, `cs:${snap.baseCs}`, null)
+    );
+    const tResources = Date.now();
+    logDiag(`[scm] built ${resources.length} diff URI pairs in ${tResources - tRefresh}ms`);
+
+    const title = `Plastic SCM: Changes (${snap.branch || 'unknown'})`;
+
+    logDiag(`[scm] calling _workbench.openMultiDiffEditor`);
+    await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
+      title,
+      resources,
+    });
+    const tOpen = Date.now();
+    logDiag(`[scm] openMultiDiffEditor returned in ${tOpen - tResources}ms`);
+
+    logDiag(`[scm] ──── viewAllChanges done in ${tOpen - t0}ms ────`);
+  }
+
+  /** View diff between two arbitrary changesets. */
+  async viewChangesetDiff(): Promise<void> {
+    const fromInput = await vscode.window.showInputBox({
+      prompt: 'Source changeset number',
+      placeHolder: 'e.g. 42',
+    });
+    if (!fromInput) return;
+
+    const toInput = await vscode.window.showInputBox({
+      prompt: 'Destination changeset number',
+      placeHolder: 'e.g. 45',
+    });
+    if (!toInput) return;
+
+    const fromCs = parseInt(fromInput, 10);
+    const toCs = parseInt(toInput, 10);
+    if (isNaN(fromCs) || isNaN(toCs)) {
+      vscode.window.showErrorMessage('Invalid changeset number.');
+      return;
+    }
+
+    const changes = await getChangesetDiff(this.workspaceRoot, fromCs, toCs);
+    if (changes.length === 0) {
+      vscode.window.showInformationMessage(`No differences between cs:${fromCs} and cs:${toCs}.`);
+      return;
+    }
+
+    const resources = changes.map(c =>
+      this.diffUris(c, `cs:${fromCs}`, `cs:${toCs}`)
+    );
+
+    await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
+      title: `Plastic SCM: cs:${fromCs} ↔ cs:${toCs}`,
+      resources,
+    });
+  }
+
+  // ---------- Presentation ----------
+
+  private statusLabel(status: ChangeStatus): string {
+    const labels: Record<ChangeStatus, string> = {
+      [ChangeStatus.Added]: 'Added',
+      [ChangeStatus.Changed]: 'Changed',
+      [ChangeStatus.Moved]: 'Moved',
+      [ChangeStatus.Deleted]: 'Deleted',
+    };
+    return labels[status] || status;
+  }
+
+  private statusIcon(status: ChangeStatus): vscode.ThemeIcon {
+    switch (status) {
+      case ChangeStatus.Added:
+        return new vscode.ThemeIcon('diff-added', new vscode.ThemeColor('gitDecoration.addedResourceForeground'));
+      case ChangeStatus.Deleted:
+        return new vscode.ThemeIcon('diff-removed', new vscode.ThemeColor('gitDecoration.deletedResourceForeground'));
+      case ChangeStatus.Moved:
+        return new vscode.ThemeIcon('diff-renamed', new vscode.ThemeColor('gitDecoration.renamedResourceForeground'));
+      default:
+        return new vscode.ThemeIcon('diff-modified', new vscode.ThemeColor('gitDecoration.modifiedResourceForeground'));
+    }
+  }
+
+  dispose(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+    }
+    for (const d of this.disposables) {
+      d.dispose();
+    }
+  }
+}
