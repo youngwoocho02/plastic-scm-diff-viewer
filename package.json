@@ -58,7 +58,11 @@
         "command": "plasticDiff.clearCache",
         "title": "Clear Content Cache",
         "category": "Plastic SCM"
-      }
+      },
+      { "command": "plasticDiff.openFile",         "title": "Open File",          "category": "Plastic SCM" },
+      { "command": "plasticDiff.openBaseRevision", "title": "Open Base Revision", "category": "Plastic SCM" },
+      { "command": "plasticDiff.openDiff",         "title": "Open Diff",          "category": "Plastic SCM" },
+      { "command": "plasticDiff.copyPath",         "title": "Copy Path",          "category": "Plastic SCM" }
     ],
     "menus": {
       "scm/title": [
@@ -79,6 +83,12 @@
           "group": "inline@1",
           "when": "scmProvider == plastic"
         }
+      ],
+      "scm/resourceState/context": [
+        { "command": "plasticDiff.openDiff",         "group": "navigation@1", "when": "scmProvider == plastic" },
+        { "command": "plasticDiff.openFile",         "group": "navigation@2", "when": "scmProvider == plastic && scmResourceState != plastic:D" },
+        { "command": "plasticDiff.openBaseRevision", "group": "1_open@1",     "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/" },
+        { "command": "plasticDiff.copyPath",         "group": "9_misc@1",     "when": "scmProvider == plastic" }
       ]
     },
     "configuration": {

@@ -31,7 +31,7 @@ type MultiDiffResourceState = vscode.SourceControlResourceState & {
  * `cm status` is NOT used for the change list because it reports phantom CH
  * for byte-identical files.
  */
-export class PlasticScmProvider implements vscode.Disposable {
+export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffProvider, vscode.FileDecorationProvider {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly sourceControl: vscode.SourceControl;
   private readonly addedGroup: vscode.SourceControlResourceGroup;
@@ -41,6 +41,10 @@ export class PlasticScmProvider implements vscode.Disposable {
   private readonly contentProvider: PlasticContentProvider;
   private refreshTimer: ReturnType<typeof setInterval> | undefined;
   private refreshInflight: Promise<void> | undefined;
+  private changeByPath = new Map<string, PlasticChange>();
+
+  private readonly _onDidChangeDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
+  readonly onDidChangeFileDecorations = this._onDidChangeDecorations.event;
   private readonly multiDiffSourceUri = vscode.Uri.parse('plastic-multi-diff:changes');
   private _multiDiffOpen = false;
 
@@ -71,6 +75,7 @@ export class PlasticScmProvider implements vscode.Disposable {
     );
     this.sourceControl.acceptInputCommand = undefined as any;
     this.sourceControl.inputBox.visible = false;
+    this.sourceControl.quickDiffProvider = this;
     this.disposables.push(this.sourceControl);
 
     this.addedGroup = this.sourceControl.createResourceGroup('added', 'Added');
@@ -102,7 +107,26 @@ export class PlasticScmProvider implements vscode.Disposable {
         clearContentCache();
         vscode.window.showInformationMessage('Plastic SCM: content cache cleared.');
       }),
+      vscode.commands.registerCommand('plasticDiff.openFile', (r: MultiDiffResourceState) => {
+        vscode.window.showTextDocument(r.resourceUri);
+      }),
+      vscode.commands.registerCommand('plasticDiff.openBaseRevision', (r: MultiDiffResourceState) => {
+        if (r.multiDiffEditorOriginalUri) {
+          vscode.commands.executeCommand('vscode.open', r.multiDiffEditorOriginalUri);
+        }
+      }),
+      vscode.commands.registerCommand('plasticDiff.openDiff', (r: MultiDiffResourceState) => {
+        if (r.command) {
+          vscode.commands.executeCommand(r.command.command, ...(r.command.arguments ?? []));
+        }
+      }),
+      vscode.commands.registerCommand('plasticDiff.copyPath', (r: MultiDiffResourceState) => {
+        vscode.env.clipboard.writeText(r.resourceUri.fsPath);
+      }),
     );
+
+    this.disposables.push(vscode.window.registerFileDecorationProvider(this));
+    this.disposables.push(this._onDidChangeDecorations);
 
     this.setupAutoRefresh();
     this.disposables.push(
@@ -146,7 +170,11 @@ export class PlasticScmProvider implements vscode.Disposable {
       return this.refreshInflight;
     }
     logDiag(`[refresh] ──── begin ────`);
-    this.refreshInflight = this.doRefresh().finally(() => {
+    this.refreshInflight = vscode.window.withProgress(
+      { location: vscode.ProgressLocation.SourceControl },
+      () => this.doRefresh()
+    ).then(() => {}, (e) => { logDiag(`[refresh] progress error: ${e?.message}`); }) as Promise<void>;
+    this.refreshInflight = this.refreshInflight.finally(() => {
       this.refreshInflight = undefined;
     });
     return this.refreshInflight;
@@ -239,6 +267,24 @@ export class PlasticScmProvider implements vscode.Disposable {
     this.movedGroup.resourceStates   = changes.filter(c => c.status === ChangeStatus.Moved)  .map(c => this.toResourceState(c, baseCs));
     this.deletedGroup.resourceStates = changes.filter(c => c.status === ChangeStatus.Deleted).map(c => this.toResourceState(c, baseCs));
     this.sourceControl.count = changes.length;
+    this.sourceControl.statusBarCommands = branch ? [
+      { title: `$(git-branch) ${branch}`, command: 'plasticDiff.refresh', tooltip: 'Plastic SCM — click to refresh' },
+      { title: `$(git-commit) cs:${baseCs}`, command: 'plasticDiff.viewAllChanges', tooltip: 'Click to open multi-diff' },
+    ] : [
+      { title: `$(git-commit) cs:${baseCs}`, command: 'plasticDiff.viewAllChanges', tooltip: 'Click to open multi-diff' },
+    ];
+
+    // Rebuild changeByPath for quickDiffProvider and FileDecorationProvider
+    this.changeByPath.clear();
+    for (const c of changes) {
+      if (c.status === ChangeStatus.Moved) {
+        this.changeByPath.set(this.absOf(c.path), c);
+      } else {
+        this.changeByPath.set(this.absOf(c.path), c);
+      }
+    }
+    this._onDidChangeDecorations.fire(undefined);
+
     logDiag(`[refresh] committed snapshot: ${changes.length} items baseCs=${baseCs} filtered=${phantomFiltered}`);
   }
 
@@ -306,6 +352,7 @@ export class PlasticScmProvider implements vscode.Disposable {
 
     return {
       resourceUri,
+      contextValue: `plastic:${change.status}`,
       decorations: {
         strikeThrough: change.status === ChangeStatus.Deleted,
         tooltip: this.statusLabel(change),
@@ -448,6 +495,38 @@ export class PlasticScmProvider implements vscode.Disposable {
         return new vscode.ThemeIcon('diff-renamed', new vscode.ThemeColor('gitDecoration.renamedResourceForeground'));
       default:
         return new vscode.ThemeIcon('diff-modified', new vscode.ThemeColor('gitDecoration.modifiedResourceForeground'));
+    }
+  }
+
+  // ---------- QuickDiffProvider ----------
+
+  provideOriginalResource(uri: vscode.Uri): vscode.Uri | undefined {
+    if (uri.scheme !== 'file') return undefined;
+    const abs = uri.fsPath;
+    const change = this.changeByPath.get(abs);
+    if (!change) return undefined;
+    if (change.status === ChangeStatus.Added) return undefined;
+    const basePath = change.status === ChangeStatus.Moved && change.oldPath
+      ? this.absOf(change.oldPath)
+      : abs;
+    return toPlasticUri(basePath, `cs:${this.lastSnapshot.baseCs}`);
+  }
+
+  // ---------- FileDecorationProvider ----------
+
+  provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
+    if (uri.scheme !== 'file') return undefined;
+    const change = this.changeByPath.get(uri.fsPath);
+    if (!change) return undefined;
+    switch (change.status) {
+      case ChangeStatus.Added:
+        return { badge: 'A', tooltip: 'Added', color: new vscode.ThemeColor('gitDecoration.addedResourceForeground'), propagate: true };
+      case ChangeStatus.Changed:
+        return { badge: 'M', tooltip: 'Modified', color: new vscode.ThemeColor('gitDecoration.modifiedResourceForeground'), propagate: true };
+      case ChangeStatus.Moved:
+        return { badge: 'R', tooltip: 'Moved/Renamed', color: new vscode.ThemeColor('gitDecoration.renamedResourceForeground'), propagate: true };
+      case ChangeStatus.Deleted:
+        return { badge: 'D', tooltip: 'Deleted', color: new vscode.ThemeColor('gitDecoration.deletedResourceForeground'), propagate: true };
     }
   }
 
