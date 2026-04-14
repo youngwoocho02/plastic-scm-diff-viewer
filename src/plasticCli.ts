@@ -264,23 +264,38 @@ export async function getPendingChangesRaw(cwd: string, baseCs: number): Promise
     if (!trimmed) continue;
     totalLines++;
     const parts = trimmed.split('\t');
-    if (parts.length < 3) continue;
 
-    const isDir = parts[2].trim().toLowerCase() === 'true';
-    if (isDir) { skippedDir++; continue; }
+    const rawCode = parts[0].trim().toUpperCase();
+    const isMoved = rawCode === 'LM' || rawCode === 'MV';
 
-    const status = parseStatusCode(parts[0].trim());
-    if (!status) { skippedNoStatus++; continue; }
-
-    const abs = parts[1].trim();
-    if (!abs) continue;
-
-    byStatus[status] = (byStatus[status] || 0) + 1;
-    parsed.push({ status, path: abs });
+    // LM/MV: STATUS \t SIMILARITY% \t OLD_PATH \t NEW_PATH \t ISDIR \t ...
+    // Other: STATUS \t PATH \t ISDIR \t ...
+    if (isMoved) {
+      if (parts.length < 5) continue;
+      const isDir = parts[4].trim().toLowerCase() === 'true';
+      if (isDir) { skippedDir++; continue; }
+      const status = parseStatusCode(rawCode);
+      if (!status) { skippedNoStatus++; continue; }
+      const oldAbs = parts[2].trim();
+      const newAbs = parts[3].trim();
+      if (!newAbs) continue;
+      byStatus[status] = (byStatus[status] || 0) + 1;
+      parsed.push({ status, path: newAbs, oldPath: oldAbs || undefined });
+    } else {
+      if (parts.length < 3) continue;
+      const isDir = parts[2].trim().toLowerCase() === 'true';
+      if (isDir) { skippedDir++; continue; }
+      const status = parseStatusCode(rawCode);
+      if (!status) { skippedNoStatus++; continue; }
+      const abs = parts[1].trim();
+      if (!abs) continue;
+      byStatus[status] = (byStatus[status] || 0) + 1;
+      parsed.push({ status, path: abs });
+    }
   }
   log(
     `[status] parsed: ${totalLines} lines, ` +
-    `kept=${parsed.length} (A=${byStatus.A || 0} C=${byStatus.C || 0} D=${byStatus.D || 0} M=${byStatus.M || 0}) ` +
+    `kept=${parsed.length} (A=${byStatus[ChangeStatus.Added] || 0} C=${byStatus[ChangeStatus.Changed] || 0} D=${byStatus[ChangeStatus.Deleted] || 0} M=${byStatus[ChangeStatus.Moved] || 0}) ` +
     `skip: dir=${skippedDir} noise=${skippedNoStatus} ` +
     `in ${Date.now() - tStart}ms`
   );
