@@ -96,6 +96,19 @@ code --install-extension plastic-scm-diff-viewer-0.1.0.vsix --force
 # VSCode reload (Ctrl+R) 해야 새 버전 적용
 ```
 
+### 구현검증 필수 절차
+
+`npx tsc --noEmit` 타입 체크만으로는 검증 완료가 아님. VSCode 확장은 실제 설치·동작까지 확인해야 한다.
+
+```bash
+npm run build
+npx @vscode/vsce package --allow-missing-repository
+code --install-extension plastic-scm-diff-viewer-0.1.0.vsix --force
+# VSCode에서 Ctrl+Shift+P → "Developer: Reload Window"
+```
+
+이후 SCM 사이드바에서 실제 변경 사항이 의도한 대로 표시되는지 확인.
+
 ### 개발 중 디버그 실행 (VSCode 재설치 없이)
 
 `.vscode/launch.json`이 있으면 `F5`로 Extension Development Host 새 창이 뜸. 현재는 launch.json 없음 — 필요하면 추가.

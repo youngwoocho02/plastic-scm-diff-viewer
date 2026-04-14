@@ -34,10 +34,15 @@ type MultiDiffResourceState = vscode.SourceControlResourceState & {
 export class PlasticScmProvider implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly sourceControl: vscode.SourceControl;
-  private readonly changesGroup: vscode.SourceControlResourceGroup;
+  private readonly addedGroup: vscode.SourceControlResourceGroup;
+  private readonly changedGroup: vscode.SourceControlResourceGroup;
+  private readonly movedGroup: vscode.SourceControlResourceGroup;
+  private readonly deletedGroup: vscode.SourceControlResourceGroup;
   private readonly contentProvider: PlasticContentProvider;
   private refreshTimer: ReturnType<typeof setInterval> | undefined;
   private refreshInflight: Promise<void> | undefined;
+  private readonly multiDiffSourceUri = vscode.Uri.parse('plastic-multi-diff:changes');
+  private _multiDiffOpen = false;
 
   /** Set while Stage 2 (phantom filter) is still running. viewAllChanges
    *  awaits this so Multi Diff never opens with phantom files included. */
@@ -68,9 +73,21 @@ export class PlasticScmProvider implements vscode.Disposable {
     this.sourceControl.inputBox.visible = false;
     this.disposables.push(this.sourceControl);
 
-    this.changesGroup = this.sourceControl.createResourceGroup('changes', 'Changes');
-    this.changesGroup.hideWhenEmpty = true;
-    this.disposables.push(this.changesGroup);
+    this.addedGroup = this.sourceControl.createResourceGroup('added', 'Added');
+    this.addedGroup.hideWhenEmpty = true;
+    this.disposables.push(this.addedGroup);
+
+    this.changedGroup = this.sourceControl.createResourceGroup('changed', 'Changed');
+    this.changedGroup.hideWhenEmpty = true;
+    this.disposables.push(this.changedGroup);
+
+    this.movedGroup = this.sourceControl.createResourceGroup('moved', 'Moved');
+    this.movedGroup.hideWhenEmpty = true;
+    this.disposables.push(this.movedGroup);
+
+    this.deletedGroup = this.sourceControl.createResourceGroup('deleted', 'Deleted');
+    this.deletedGroup.hideWhenEmpty = true;
+    this.disposables.push(this.deletedGroup);
 
     this.contentProvider = new PlasticContentProvider(workspaceRoot);
     this.disposables.push(
@@ -88,6 +105,16 @@ export class PlasticScmProvider implements vscode.Disposable {
     );
 
     this.setupAutoRefresh();
+    this.disposables.push(
+      vscode.window.tabGroups.onDidChangeTabs(e => {
+        for (const tab of e.closed) {
+          if (tab.label?.startsWith('Plastic SCM: Changes')) {
+            this._multiDiffOpen = false;
+            break;
+          }
+        }
+      })
+    );
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration(e => {
         if (e.affectsConfiguration('plasticDiff.autoRefreshInterval')) {
@@ -187,6 +214,11 @@ export class PlasticScmProvider implements vscode.Disposable {
       await Promise.all([phantomPromise, prefetchPromise]);
       logDiag(`[refresh] stage2+3 parallel: ${Date.now() - tWarmStart}ms`);
 
+      if (this._multiDiffOpen) {
+        logDiag(`[refresh] multi-diff open — re-invoking viewAllChanges`);
+        this.viewAllChanges();
+      }
+
       logDiag(`[refresh] ──── done in ${Date.now() - t0}ms ────`);
     } catch (err: any) {
       logDiag(`[refresh] FAIL: ${err.message}`);
@@ -202,7 +234,10 @@ export class PlasticScmProvider implements vscode.Disposable {
     phantomFiltered: boolean,
   ): void {
     this.lastSnapshot = { changes, baseCs, branch, time: Date.now(), phantomFiltered };
-    this.changesGroup.resourceStates = changes.map(c => this.toResourceState(c, baseCs));
+    this.addedGroup.resourceStates   = changes.filter(c => c.status === ChangeStatus.Added)  .map(c => this.toResourceState(c, baseCs));
+    this.changedGroup.resourceStates = changes.filter(c => c.status === ChangeStatus.Changed).map(c => this.toResourceState(c, baseCs));
+    this.movedGroup.resourceStates   = changes.filter(c => c.status === ChangeStatus.Moved)  .map(c => this.toResourceState(c, baseCs));
+    this.deletedGroup.resourceStates = changes.filter(c => c.status === ChangeStatus.Deleted).map(c => this.toResourceState(c, baseCs));
     this.sourceControl.count = changes.length;
     logDiag(`[refresh] committed snapshot: ${changes.length} items baseCs=${baseCs} filtered=${phantomFiltered}`);
   }
@@ -252,7 +287,12 @@ export class PlasticScmProvider implements vscode.Disposable {
     switch (change.status) {
       case ChangeStatus.Added:   return `${base} (Added)`;
       case ChangeStatus.Deleted: return `${base} (Deleted)`;
-      case ChangeStatus.Moved:   return `${base} (Moved)`;
+      case ChangeStatus.Moved: {
+        const oldBase = change.oldPath ? path.basename(change.oldPath) : undefined;
+        return oldBase && oldBase !== base
+          ? `${oldBase} → ${base}`
+          : `${base} (Moved)`;
+      }
       default:                   return `${base} (Plastic SCM)`;
     }
   }
@@ -268,7 +308,7 @@ export class PlasticScmProvider implements vscode.Disposable {
       resourceUri,
       decorations: {
         strikeThrough: change.status === ChangeStatus.Deleted,
-        tooltip: this.statusLabel(change.status),
+        tooltip: this.statusLabel(change),
         iconPath: this.statusIcon(change.status),
       },
       command: {
@@ -333,12 +373,14 @@ export class PlasticScmProvider implements vscode.Disposable {
 
     logDiag(`[scm] calling _workbench.openMultiDiffEditor`);
     await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
+      multiDiffSourceUri: this.multiDiffSourceUri,
       title,
       resources,
     });
     const tOpen = Date.now();
     logDiag(`[scm] openMultiDiffEditor returned in ${tOpen - tResources}ms`);
 
+    this._multiDiffOpen = true;
     logDiag(`[scm] ──── viewAllChanges done in ${tOpen - t0}ms ────`);
   }
 
@@ -381,14 +423,19 @@ export class PlasticScmProvider implements vscode.Disposable {
 
   // ---------- Presentation ----------
 
-  private statusLabel(status: ChangeStatus): string {
+  private statusLabel(change: PlasticChange): string {
+    if (change.status === ChangeStatus.Moved) {
+      return change.oldPath
+        ? `Moved\nFrom: ${change.oldPath}\nTo: ${change.path}`
+        : 'Moved';
+    }
     const labels: Record<ChangeStatus, string> = {
       [ChangeStatus.Added]: 'Added',
       [ChangeStatus.Changed]: 'Changed',
       [ChangeStatus.Moved]: 'Moved',
       [ChangeStatus.Deleted]: 'Deleted',
     };
-    return labels[status] || status;
+    return labels[change.status] || change.status;
   }
 
   private statusIcon(status: ChangeStatus): vscode.ThemeIcon {
