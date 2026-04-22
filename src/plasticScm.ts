@@ -130,6 +130,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       vscode.commands.registerCommand('plasticDiff.copyPath', (r: MultiDiffResourceState) => {
         vscode.env.clipboard.writeText(r.resourceUri.fsPath);
       }),
+      vscode.commands.registerCommand('plasticDiff.filterChanges', () => this.showFilterQuickPick()),
     );
 
     this.disposables.push(vscode.window.registerFileDecorationProvider(this));
@@ -595,6 +596,50 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       case ChangeStatus.Deleted:
         return { badge: 'D', tooltip: 'Deleted', color: new vscode.ThemeColor('gitDecoration.deletedResourceForeground'), propagate: true };
     }
+  }
+
+  // ---------- Filter QuickPick ----------
+
+  private async showFilterQuickPick(): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration('plasticDiff');
+    const items: Array<vscode.QuickPickItem & { key: string }> = [
+      {
+        key: 'hideTrivialChanges',
+        label: 'Hide Trivial Changes (.cs using/namespace/comment only)',
+        picked: cfg.get<boolean>('hideTrivialChanges', true),
+      },
+      {
+        key: 'hidePureRenames',
+        label: 'Hide Pure Renames (no content change)',
+        picked: cfg.get<boolean>('hidePureRenames', true),
+      },
+      {
+        key: 'hideMetaFiles',
+        label: 'Hide .meta Files',
+        picked: cfg.get<boolean>('hideMetaFiles', true),
+      },
+    ];
+
+    const qp = vscode.window.createQuickPick<vscode.QuickPickItem & { key: string }>();
+    qp.title = 'Plastic SCM: Filter Changes';
+    qp.placeholder = 'Toggle filters (checked = hidden)';
+    qp.canSelectMany = true;
+    qp.items = items;
+    qp.selectedItems = items.filter(i => i.picked);
+
+    qp.onDidChangeSelection(selected => {
+      const selectedKeys = new Set(selected.map(r => (r as vscode.QuickPickItem & { key: string }).key));
+      for (const item of items) {
+        const newVal = selectedKeys.has(item.key);
+        if (cfg.get<boolean>(item.key) !== newVal) {
+          cfg.update(item.key, newVal, vscode.ConfigurationTarget.Workspace);
+        }
+      }
+      this.refresh();
+    });
+
+    qp.onDidHide(() => qp.dispose());
+    qp.show();
   }
 
   dispose(): void {

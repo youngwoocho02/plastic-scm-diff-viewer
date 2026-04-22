@@ -60,6 +60,12 @@
         "category": "Plastic SCM"
       },
       {
+        "command": "plasticDiff.filterChanges",
+        "title": "Filter Changes…",
+        "category": "Plastic SCM",
+        "icon": "$(filter)"
+      },
+      {
         "command": "plasticDiff.openFile",
         "title": "Open File",
         "category": "Plastic SCM"
@@ -84,6 +90,11 @@
       "scm/title": [
         {
           "command": "plasticDiff.viewAllChanges",
+          "group": "navigation",
+          "when": "scmProvider == plastic"
+        },
+        {
+          "command": "plasticDiff.filterChanges",
           "group": "navigation",
           "when": "scmProvider == plastic"
         },

@@ -54,8 +54,16 @@ const _contentCache = new Map<string, Buffer>();
  *  it shares the existing Promise instead of starting another cm cat. */
 const _inflight = new Map<string, Promise<Buffer>>();
 
+function normalizeCacheKeyPath(p: string): string {
+  let s = p.replace(/\\/g, '/');
+  if (s.length >= 2 && /^[A-Z]$/.test(s[0]) && s[1] === ':') {
+    s = s[0].toLowerCase() + s.slice(1);
+  }
+  return s;
+}
+
 function cacheKey(filePath: string, ref: string): string {
-  return `${ref}\x00${filePath}`;
+  return `${ref}\x00${normalizeCacheKeyPath(filePath)}`;
 }
 
 /** Clear cache — exposed as a user command for troubleshooting.

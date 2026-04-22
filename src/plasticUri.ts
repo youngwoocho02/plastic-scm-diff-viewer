@@ -22,7 +22,13 @@ export function toPlasticUri(
 export function parsePlasticUri(uri: vscode.Uri): { path: string; ref: string } {
   const match = uri.query.match(/(?:^|&)ref=([^&]*)/);
   const ref = match ? decodeURIComponent(match[1]) : '';
-  // Use uri.path (raw path component) not fsPath — the latter does
-  // platform-specific munging that can corrupt non-file schemes.
-  return { path: uri.path, ref };
+  // uri.path returns URI-style path: /c:/foo/bar on Windows.
+  // cm cat needs a native filesystem path, so strip the leading slash
+  // before a drive letter. (Don't use uri.fsPath — unreliable for
+  // non-file schemes.)
+  let p = uri.path;
+  if (p.length >= 3 && p[0] === '/' && /^[a-zA-Z]$/.test(p[1]) && p[2] === ':') {
+    p = p.slice(1);
+  }
+  return { path: p, ref };
 }
