@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { EMPTY_REF, parsePlasticUri } from './types';
+import { EMPTY_REF } from './types';
+import { parsePlasticUri } from './plasticUri';
 import { getFileContent, logDiag } from './plasticCli';
 
 /**

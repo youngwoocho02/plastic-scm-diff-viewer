@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { ChangeStatus, EMPTY_REF, PlasticChange, toPlasticUri } from './types';
+import { ChangeStatus, EMPTY_REF, PlasticChange } from './types';
+import { toPlasticUri } from './plasticUri';
 import {
   getPendingChangesRaw,
   filterPhantomChanges,
+  filterTrivialChanges,
   getWorkspaceInfo,
   getChangesetDiff,
   clearContentCache,
@@ -38,6 +40,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
   private readonly changedGroup: vscode.SourceControlResourceGroup;
   private readonly movedGroup: vscode.SourceControlResourceGroup;
   private readonly deletedGroup: vscode.SourceControlResourceGroup;
+  private readonly privateGroup: vscode.SourceControlResourceGroup;
   private readonly contentProvider: PlasticContentProvider;
   private refreshTimer: ReturnType<typeof setInterval> | undefined;
   private refreshInflight: Promise<void> | undefined;
@@ -93,6 +96,10 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this.deletedGroup = this.sourceControl.createResourceGroup('deleted', 'Deleted');
     this.deletedGroup.hideWhenEmpty = true;
     this.disposables.push(this.deletedGroup);
+
+    this.privateGroup = this.sourceControl.createResourceGroup('private', 'Private (Untracked)');
+    this.privateGroup.hideWhenEmpty = true;
+    this.disposables.push(this.privateGroup);
 
     this.contentProvider = new PlasticContentProvider(workspaceRoot);
     this.disposables.push(
@@ -208,7 +215,12 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       const tRawStart = Date.now();
       const raw = await getPendingChangesRaw(this.workspaceRoot, baseCs);
       logDiag(`[refresh] stage1 raw status: ${Date.now() - tRawStart}ms (${raw.length} items, phantoms included)`);
-      this.commitSnapshot(raw, baseCs, branch, false);
+      // Only commit the raw (unfiltered) snapshot on the very first load —
+      // refreshing an already-populated SCM panel with raw then filtered
+      // produces a visible "list grows then shrinks" flicker every cycle.
+      if (this.lastSnapshot.time === 0) {
+        this.commitSnapshot(raw, baseCs, branch, false);
+      }
 
       // Stage 2 + 3 in parallel:
       //   - Phantom filter: drop byte-identical Changed → recommit snapshot
@@ -222,8 +234,32 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       // to also wait for prefetch (which only affects cache warmth).
       const phantomPromise = (async () => {
         const tStart = Date.now();
-        const filtered = await filterPhantomChanges(this.workspaceRoot, baseCs, raw);
+        let filtered = await filterPhantomChanges(this.workspaceRoot, baseCs, raw);
         logDiag(`[refresh] phantom: ${Date.now() - tStart}ms (${filtered.length} kept, ${raw.length - filtered.length} dropped)`);
+
+        const cfg = vscode.workspace.getConfiguration('plasticDiff');
+        const hideTrivial = cfg.get<boolean>('hideTrivialChanges', true);
+        if (hideTrivial) {
+          const tT = Date.now();
+          const before = filtered.length;
+          filtered = await filterTrivialChanges(this.workspaceRoot, baseCs, filtered);
+          logDiag(`[refresh] trivial: ${Date.now() - tT}ms (${filtered.length} kept, ${before - filtered.length} dropped)`);
+        }
+
+        const hidePureRenames = cfg.get<boolean>('hidePureRenames', true);
+        if (hidePureRenames) {
+          const before = filtered.length;
+          filtered = filtered.filter(c => !(c.status === ChangeStatus.Moved && !c.contentChanged));
+          logDiag(`[refresh] pure-rename: ${filtered.length} kept, ${before - filtered.length} dropped`);
+        }
+
+        const hideMeta = cfg.get<boolean>('hideMetaFiles', true);
+        if (hideMeta) {
+          const before = filtered.length;
+          filtered = filtered.filter(c => !c.path.toLowerCase().endsWith('.meta'));
+          logDiag(`[refresh] meta: ${filtered.length} kept, ${before - filtered.length} dropped`);
+        }
+
         this.commitSnapshot(filtered, baseCs, branch, true);
       })();
       this.phantomInflight = phantomPromise.finally(() => {
@@ -266,6 +302,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this.changedGroup.resourceStates = changes.filter(c => c.status === ChangeStatus.Changed).map(c => this.toResourceState(c, baseCs));
     this.movedGroup.resourceStates   = changes.filter(c => c.status === ChangeStatus.Moved)  .map(c => this.toResourceState(c, baseCs));
     this.deletedGroup.resourceStates = changes.filter(c => c.status === ChangeStatus.Deleted).map(c => this.toResourceState(c, baseCs));
+    this.privateGroup.resourceStates = changes.filter(c => c.status === ChangeStatus.Private).map(c => this.toResourceState(c, baseCs));
     this.sourceControl.count = changes.length;
     this.sourceControl.statusBarCommands = branch ? [
       { title: `$(git-branch) ${branch}`, command: 'plasticDiff.refresh', tooltip: 'Plastic SCM — click to refresh' },
@@ -315,7 +352,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     const absPath = this.absOf(change.path);
     const oldAbs = change.oldPath ? this.absOf(change.oldPath) : absPath;
 
-    const originalUri = change.status === ChangeStatus.Added
+    const originalUri = (change.status === ChangeStatus.Added || change.status === ChangeStatus.Private)
       ? toPlasticUri(absPath, EMPTY_REF)
       : toPlasticUri(oldAbs, originalRef);
 
@@ -332,12 +369,14 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     const base = path.basename(absPath);
     switch (change.status) {
       case ChangeStatus.Added:   return `${base} (Added)`;
+      case ChangeStatus.Private: return `${base} (Private — Untracked)`;
       case ChangeStatus.Deleted: return `${base} (Deleted)`;
       case ChangeStatus.Moved: {
         const oldBase = change.oldPath ? path.basename(change.oldPath) : undefined;
+        const suffix = change.contentChanged ? ' [+M]' : '';
         return oldBase && oldBase !== base
-          ? `${oldBase} → ${base}`
-          : `${base} (Moved)`;
+          ? `${oldBase} → ${base}${suffix}`
+          : `${base} (Moved${change.contentChanged ? ' + Modified' : ''})`;
       }
       default:                   return `${base} (Plastic SCM)`;
     }
@@ -403,11 +442,11 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       return;
     }
 
-    const byStatus = { A: 0, C: 0, D: 0, M: 0 };
+    const byStatus = { A: 0, C: 0, D: 0, M: 0, P: 0 };
     for (const c of snap.changes) byStatus[c.status]++;
     logDiag(
       `[scm] using snapshot: ${snap.changes.length} files ` +
-      `(A=${byStatus.A} C=${byStatus.C} D=${byStatus.D} M=${byStatus.M}) baseCs=${snap.baseCs}`
+      `(A=${byStatus.A} C=${byStatus.C} D=${byStatus.D} M=${byStatus.M} P=${byStatus.P}) baseCs=${snap.baseCs}`
     );
 
     const resources = snap.changes.map(c =>
@@ -417,6 +456,25 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     logDiag(`[scm] built ${resources.length} diff URI pairs in ${tResources - tRefresh}ms`);
 
     const title = `Plastic SCM: Changes (${snap.branch || 'unknown'})`;
+
+    // VSCode caches the MultiDiffEditorInput keyed by multiDiffSourceUri — a
+    // plain re-invocation of _workbench.openMultiDiffEditor reuses the cached
+    // resources array and silently ignores the fresh one. Close the existing
+    // tab first so the reopen builds a new input.
+    if (this._multiDiffOpen) {
+      const tTabClose = Date.now();
+      const victims: vscode.Tab[] = [];
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          if (tab.label?.startsWith('Plastic SCM: Changes')) victims.push(tab);
+        }
+      }
+      if (victims.length > 0) {
+        await vscode.window.tabGroups.close(victims, true);
+        logDiag(`[scm] closed ${victims.length} stale multi-diff tab(s) in ${Date.now() - tTabClose}ms`);
+      }
+      this._multiDiffOpen = false;
+    }
 
     logDiag(`[scm] calling _workbench.openMultiDiffEditor`);
     await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
@@ -472,15 +530,17 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
 
   private statusLabel(change: PlasticChange): string {
     if (change.status === ChangeStatus.Moved) {
+      const head = change.contentChanged ? 'Moved + Modified' : 'Moved';
       return change.oldPath
-        ? `Moved\nFrom: ${change.oldPath}\nTo: ${change.path}`
-        : 'Moved';
+        ? `${head}\nFrom: ${change.oldPath}\nTo: ${change.path}`
+        : head;
     }
     const labels: Record<ChangeStatus, string> = {
       [ChangeStatus.Added]: 'Added',
       [ChangeStatus.Changed]: 'Changed',
       [ChangeStatus.Moved]: 'Moved',
       [ChangeStatus.Deleted]: 'Deleted',
+      [ChangeStatus.Private]: 'Private (Untracked)',
     };
     return labels[change.status] || change.status;
   }
@@ -489,6 +549,8 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     switch (status) {
       case ChangeStatus.Added:
         return new vscode.ThemeIcon('diff-added', new vscode.ThemeColor('gitDecoration.addedResourceForeground'));
+      case ChangeStatus.Private:
+        return new vscode.ThemeIcon('diff-added', new vscode.ThemeColor('gitDecoration.untrackedResourceForeground'));
       case ChangeStatus.Deleted:
         return new vscode.ThemeIcon('diff-removed', new vscode.ThemeColor('gitDecoration.deletedResourceForeground'));
       case ChangeStatus.Moved:
@@ -506,9 +568,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     const change = this.changeByPath.get(abs);
     if (!change) return undefined;
     if (change.status === ChangeStatus.Added) return undefined;
-    const basePath = change.status === ChangeStatus.Moved && change.oldPath
-      ? this.absOf(change.oldPath)
-      : abs;
+    const basePath = change.oldPath ? this.absOf(change.oldPath) : abs;
     return toPlasticUri(basePath, `cs:${this.lastSnapshot.baseCs}`);
   }
 
@@ -521,10 +581,17 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     switch (change.status) {
       case ChangeStatus.Added:
         return { badge: 'A', tooltip: 'Added', color: new vscode.ThemeColor('gitDecoration.addedResourceForeground'), propagate: true };
+      case ChangeStatus.Private:
+        return { badge: 'U', tooltip: 'Private (Untracked)', color: new vscode.ThemeColor('gitDecoration.untrackedResourceForeground'), propagate: true };
       case ChangeStatus.Changed:
         return { badge: 'M', tooltip: 'Modified', color: new vscode.ThemeColor('gitDecoration.modifiedResourceForeground'), propagate: true };
       case ChangeStatus.Moved:
-        return { badge: 'R', tooltip: 'Moved/Renamed', color: new vscode.ThemeColor('gitDecoration.renamedResourceForeground'), propagate: true };
+        return {
+          badge: change.contentChanged ? 'R*' : 'R',
+          tooltip: change.contentChanged ? 'Moved/Renamed + Modified' : 'Moved/Renamed',
+          color: new vscode.ThemeColor('gitDecoration.renamedResourceForeground'),
+          propagate: true,
+        };
       case ChangeStatus.Deleted:
         return { badge: 'D', tooltip: 'Deleted', color: new vscode.ThemeColor('gitDecoration.deletedResourceForeground'), propagate: true };
     }

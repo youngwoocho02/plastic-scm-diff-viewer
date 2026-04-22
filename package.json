@@ -59,10 +59,26 @@
         "title": "Clear Content Cache",
         "category": "Plastic SCM"
       },
-      { "command": "plasticDiff.openFile",         "title": "Open File",          "category": "Plastic SCM" },
-      { "command": "plasticDiff.openBaseRevision", "title": "Open Base Revision", "category": "Plastic SCM" },
-      { "command": "plasticDiff.openDiff",         "title": "Open Diff",          "category": "Plastic SCM" },
-      { "command": "plasticDiff.copyPath",         "title": "Copy Path",          "category": "Plastic SCM" }
+      {
+        "command": "plasticDiff.openFile",
+        "title": "Open File",
+        "category": "Plastic SCM"
+      },
+      {
+        "command": "plasticDiff.openBaseRevision",
+        "title": "Open Base Revision",
+        "category": "Plastic SCM"
+      },
+      {
+        "command": "plasticDiff.openDiff",
+        "title": "Open Diff",
+        "category": "Plastic SCM"
+      },
+      {
+        "command": "plasticDiff.copyPath",
+        "title": "Copy Path",
+        "category": "Plastic SCM"
+      }
     ],
     "menus": {
       "scm/title": [
@@ -85,10 +101,26 @@
         }
       ],
       "scm/resourceState/context": [
-        { "command": "plasticDiff.openDiff",         "group": "navigation@1", "when": "scmProvider == plastic" },
-        { "command": "plasticDiff.openFile",         "group": "navigation@2", "when": "scmProvider == plastic && scmResourceState != plastic:D" },
-        { "command": "plasticDiff.openBaseRevision", "group": "1_open@1",     "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/" },
-        { "command": "plasticDiff.copyPath",         "group": "9_misc@1",     "when": "scmProvider == plastic" }
+        {
+          "command": "plasticDiff.openDiff",
+          "group": "navigation@1",
+          "when": "scmProvider == plastic"
+        },
+        {
+          "command": "plasticDiff.openFile",
+          "group": "navigation@2",
+          "when": "scmProvider == plastic && scmResourceState != plastic:D"
+        },
+        {
+          "command": "plasticDiff.openBaseRevision",
+          "group": "1_open@1",
+          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/"
+        },
+        {
+          "command": "plasticDiff.copyPath",
+          "group": "9_misc@1",
+          "when": "scmProvider == plastic"
+        }
       ]
     },
     "configuration": {
@@ -98,6 +130,21 @@
           "type": "string",
           "default": "cm",
           "description": "Path to the Plastic SCM 'cm' CLI executable"
+        },
+        "plasticDiff.hideTrivialChanges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide Changed .cs files whose only diff is using directives, namespace declarations, comments, or whitespace. Conservative — when in doubt, the file is kept."
+        },
+        "plasticDiff.hidePureRenames": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide Moved entries with no content change (pure rename / folder relocation)."
+        },
+        "plasticDiff.hideMetaFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide Unity .meta file changes from the SCM list and Multi Diff view."
         },
         "plasticDiff.autoRefreshInterval": {
           "type": "number",
@@ -111,12 +158,14 @@
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "npm run build -- --watch",
-    "package": "vsce package"
+    "package": "vsce package",
+    "inspect": "tsx scripts/inspect-pending.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.86.0",
     "esbuild": "^0.20.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.0",
     "vscode-uri": "^3.1.0"
   }

@@ -3,6 +3,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { ChangeStatus, PlasticChange, PlasticWorkspaceInfo } from './types';
+import { parseStatusOutput } from './statusParser';
 
 // ---------- Module configuration (injected once at activation) ----------
 
@@ -79,16 +80,19 @@ export async function prefetchBaseContent(
 ): Promise<void> {
   const t0 = Date.now();
   const ref = `cs:${baseCs}`;
-  const eligible = changes.filter(c => c.status !== ChangeStatus.Added);
+  const eligible = changes.filter(c => c.status !== ChangeStatus.Added && c.status !== ChangeStatus.Private);
   log(`[prefetch] start: ${eligible.length} non-Added items`);
   let ok = 0, fail = 0;
   await Promise.all(eligible.map(async c => {
+    // Base content lives at oldPath when set (Moved entries, or CH children
+    // of a directory-move whose base path differs from the current path).
+    const basePath = c.oldPath ?? c.path;
     try {
-      await catCached(cwd, c.path, ref);
+      await catCached(cwd, basePath, ref);
       ok++;
     } catch (e: any) {
       fail++;
-      log(`[prefetch] fail ${c.path}: ${e.message}`);
+      log(`[prefetch] fail ${basePath}: ${e.message}`);
     }
   }));
   log(`[prefetch] done: ${ok} ok, ${fail} fail in ${Date.now() - t0}ms`);
@@ -256,77 +260,15 @@ export async function getPendingChangesRaw(cwd: string, baseCs: number): Promise
     return [];
   }
 
-  const parsed: PlasticChange[] = [];
-  let totalLines = 0, skippedDir = 0, skippedNoStatus = 0;
-  const byStatus: Record<string, number> = { AD: 0, CH: 0, DE: 0, MV: 0 };
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    totalLines++;
-    const parts = trimmed.split('\t');
-
-    const rawCode = parts[0].trim().toUpperCase();
-    const isMoved = rawCode === 'LM' || rawCode === 'MV';
-
-    // LM/MV: STATUS \t SIMILARITY% \t OLD_PATH \t NEW_PATH \t ISDIR \t ...
-    // Other: STATUS \t PATH \t ISDIR \t ...
-    if (isMoved) {
-      if (parts.length < 5) continue;
-      const isDir = parts[4].trim().toLowerCase() === 'true';
-      if (isDir) { skippedDir++; continue; }
-      const status = parseStatusCode(rawCode);
-      if (!status) { skippedNoStatus++; continue; }
-      const oldAbs = parts[2].trim();
-      const newAbs = parts[3].trim();
-      if (!newAbs) continue;
-      byStatus[status] = (byStatus[status] || 0) + 1;
-      parsed.push({ status, path: newAbs, oldPath: oldAbs || undefined });
-    } else {
-      if (parts.length < 3) continue;
-      const isDir = parts[2].trim().toLowerCase() === 'true';
-      if (isDir) { skippedDir++; continue; }
-      const status = parseStatusCode(rawCode);
-      if (!status) { skippedNoStatus++; continue; }
-      const abs = parts[1].trim();
-      if (!abs) continue;
-      byStatus[status] = (byStatus[status] || 0) + 1;
-      parsed.push({ status, path: abs });
-    }
-  }
+  const { changes: parsed, stats } = parseStatusOutput(raw);
   log(
-    `[status] parsed: ${totalLines} lines, ` +
-    `kept=${parsed.length} (A=${byStatus[ChangeStatus.Added] || 0} C=${byStatus[ChangeStatus.Changed] || 0} D=${byStatus[ChangeStatus.Deleted] || 0} M=${byStatus[ChangeStatus.Moved] || 0}) ` +
-    `skip: dir=${skippedDir} noise=${skippedNoStatus} ` +
+    `[status] parsed: ${stats.totalLines} lines, ` +
+    `kept=${stats.kept} (A=${stats.byStatus[ChangeStatus.Added]} C=${stats.byStatus[ChangeStatus.Changed]} D=${stats.byStatus[ChangeStatus.Deleted]} M=${stats.byStatus[ChangeStatus.Moved]} P=${stats.byStatus[ChangeStatus.Private]}) ` +
+    `skip: dir=${stats.skippedDir} noise=${stats.skippedNoStatus} ` +
     `in ${Date.now() - tStart}ms`
   );
 
   return parsed;
-}
-
-
-/**
- * Map `cm status --machinereadable` status codes to ChangeStatus.
- * Noise codes (PR private, IG ignored, pure CO) return undefined.
- */
-function parseStatusCode(s: string): ChangeStatus | undefined {
-  const upper = s.toUpperCase();
-  // CO+CH: checked out AND content changed → Changed
-  const tokens = upper.split('+');
-  if (tokens.includes('CH') && tokens.includes('CO')) return ChangeStatus.Changed;
-  // Pure CO: checked out without content change — skip
-  if (upper === 'CO') return undefined;
-
-  switch (upper) {
-    case 'AD':
-    case 'CP':  return ChangeStatus.Added;
-    case 'CH':
-    case 'RP':  return ChangeStatus.Changed;
-    case 'MV':
-    case 'LM':  return ChangeStatus.Moved;
-    case 'DE':
-    case 'LD':  return ChangeStatus.Deleted;
-    default:    return undefined;
-  }
 }
 
 /**
@@ -347,9 +289,10 @@ export async function filterPhantomChanges(
   const keep = await Promise.all(changes.map(async c => {
     if (c.status !== ChangeStatus.Changed) return true;
     const abs = path.isAbsolute(c.path) ? c.path : path.join(cwd, c.path);
+    const basePath = c.oldPath ?? c.path;
     try {
       const [baseBuf, workBuf] = await Promise.all([
-        catCached(cwd, c.path, ref),
+        catCached(cwd, basePath, ref),
         fs.readFile(abs),
       ]);
       const identical = baseBuf.equals(workBuf);
@@ -365,6 +308,83 @@ export async function filterPhantomChanges(
   }));
   const result = changes.filter((_, i) => keep[i]);
   log(`[phantom] done: dropped ${dropped}/${changedCount} in ${Date.now() - t0}ms`);
+  return result;
+}
+
+// ---------- Trivial-change filter (semantic) ----------
+//
+// Drop Changed entries whose only differences are using directives,
+// namespace declarations, line comments, or whitespace. C# only for now.
+//
+// Conservative — when in doubt, keep the file:
+//   - line comments only stripped when the line has no `"` (string-literal safe)
+//   - block comments are NOT stripped (avoids `"…/*…*/…"` corruption)
+//   - using-directive regex requires the rhs to be a dotted identifier or an
+//     alias `X = Type`, both excluding `(`/`{`. C# 8 `using var x = Foo();`
+//     and `using (var x = …) { … }` therefore do NOT match → kept.
+//   - lone braces dropped so `namespace X { … }` wrap/unwrap is trivial
+//   - `namespace` lines dropped (handles both block-scoped and file-scoped)
+
+function normalizeCSharp(text: string): string {
+  const out: string[] = [];
+  for (let raw of text.split(/\r?\n/)) {
+    let line = raw;
+    if (line.indexOf('"') === -1) {
+      const ci = line.indexOf('//');
+      if (ci !== -1) line = line.slice(0, ci);
+    }
+    line = line.trim();
+    if (!line) continue;
+    if (line === '{' || line === '}') continue;
+    if (/^using\s+(static\s+)?[\w.]+\s*;$/.test(line)) continue;
+    if (/^using\s+[\w.]+\s*=\s*[\w.<>,\s]+;$/.test(line)) continue;
+    if (/^namespace\b/.test(line)) continue;
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+/**
+ * Drop Changed entries whose only diff is using/namespace/comment/whitespace.
+ * Runs after phantom filter; reuses the same content cache.
+ */
+export async function filterTrivialChanges(
+  cwd: string,
+  baseCs: number,
+  changes: PlasticChange[],
+): Promise<PlasticChange[]> {
+  const t0 = Date.now();
+  const ref = `cs:${baseCs}`;
+  const targets = changes.filter(
+    c => c.status === ChangeStatus.Changed && c.path.toLowerCase().endsWith('.cs')
+  );
+  log(`[trivial] start: ${targets.length} .cs Changed to verify`);
+  let dropped = 0;
+  const keep = await Promise.all(changes.map(async c => {
+    if (c.status !== ChangeStatus.Changed) return true;
+    if (!c.path.toLowerCase().endsWith('.cs')) return true;
+    const abs = path.isAbsolute(c.path) ? c.path : path.join(cwd, c.path);
+    const basePath = c.oldPath ?? c.path;
+    try {
+      const [baseBuf, workBuf] = await Promise.all([
+        catCached(cwd, basePath, ref),
+        fs.readFile(abs),
+      ]);
+      const baseN = normalizeCSharp(baseBuf.toString('utf8'));
+      const workN = normalizeCSharp(workBuf.toString('utf8'));
+      if (baseN === workN) {
+        dropped++;
+        log(`[trivial] drop ${c.path} (using/namespace/comment-only)`);
+        return false;
+      }
+      return true;
+    } catch (e: any) {
+      log(`[trivial] fail ${c.path}: ${e.message}`);
+      return true;
+    }
+  }));
+  const result = changes.filter((_, i) => keep[i]);
+  log(`[trivial] done: dropped ${dropped}/${targets.length} in ${Date.now() - t0}ms`);
   return result;
 }
 
