@@ -133,6 +133,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this.disposables.push(vscode.window.registerFileDecorationProvider(this));
     this.disposables.push(this._onDidChangeDecorations);
 
+    void this.closeRestoredMultiDiffTabs();
     this.setupAutoRefresh();
     this.disposables.push(
       vscode.window.tabGroups.onDidChangeTabs(e => {
@@ -154,6 +155,24 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     );
 
     this.refresh('startup');
+  }
+
+  private async closeRestoredMultiDiffTabs(): Promise<void> {
+    const staleTabs: vscode.Tab[] = [];
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        if (tab.label?.startsWith('Plastic SCM: Changes')) {
+          staleTabs.push(tab);
+        }
+      }
+    }
+
+    if (staleTabs.length === 0) {
+      return;
+    }
+
+    await vscode.window.tabGroups.close(staleTabs, true);
+    logDiag(`[activate] closed ${staleTabs.length} restored Plastic SCM multi-diff tab(s)`);
   }
 
   private setupAutoRefresh(): void {
