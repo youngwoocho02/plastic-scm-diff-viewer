@@ -44,6 +44,9 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
 
   private readonly _onDidChangeDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
   readonly onDidChangeFileDecorations = this._onDidChangeDecorations.event;
+  private readonly multiDiffSourceUri = vscode.Uri.parse('plastic-multi-diff:changes');
+  private _multiDiffOpen = false;
+  private lastOpenedMultiDiffFingerprint: string | undefined;
 
   /** Set while Stage 2 (phantom filter) is still running. viewAllChanges
    *  awaits this so Multi Diff never opens with phantom files included. */
@@ -75,7 +78,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this.sourceControl.quickDiffProvider = this;
     this.disposables.push(this.sourceControl);
 
-    this.changesGroup = this.sourceControl.createResourceGroup('changes', 'Changes', { multiDiffEditorEnableViewChanges: true });
+    this.changesGroup = this.sourceControl.createResourceGroup('changes', 'Changes');
     this.changesGroup.hideWhenEmpty = true;
     this.disposables.push(this.changesGroup);
 
@@ -131,6 +134,17 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this.disposables.push(this._onDidChangeDecorations);
 
     this.setupAutoRefresh();
+    this.disposables.push(
+      vscode.window.tabGroups.onDidChangeTabs(e => {
+        for (const tab of e.closed) {
+          if (tab.label?.startsWith('Plastic SCM: Changes')) {
+            this._multiDiffOpen = false;
+            this.lastOpenedMultiDiffFingerprint = undefined;
+            break;
+          }
+        }
+      })
+    );
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration(e => {
         if (e.affectsConfiguration('plasticDiff.autoRefreshInterval')) {
@@ -263,6 +277,15 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       await Promise.all([phantomPromise, prefetchPromise]);
       logDiag(`[refresh] stage2+3 parallel: ${Date.now() - tWarmStart}ms`);
 
+      if (this._multiDiffOpen) {
+        const nextFingerprint = this.buildMultiDiffFingerprint(this.lastSnapshot);
+        if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
+          logDiag(`[refresh] multi-diff open — snapshot changed but keeping current view (trigger=${trigger})`);
+        } else {
+          logDiag(`[refresh] multi-diff open but snapshot unchanged — skip reopen (trigger=${trigger})`);
+        }
+      }
+
       logDiag(`[refresh] ──── done in ${Date.now() - t0}ms ────`);
     } catch (err: any) {
       logDiag(`[refresh] FAIL: ${err.message}`);
@@ -299,6 +322,28 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this._onDidChangeDecorations.fire(undefined);
 
     logDiag(`[refresh] committed snapshot: ${changes.length} items baseCs=${baseCs} filtered=${phantomFiltered}`);
+  }
+
+  private buildMultiDiffFingerprint(snap: typeof this.lastSnapshot): string {
+    return JSON.stringify({
+      baseCs: snap.baseCs,
+      branch: snap.branch,
+      changes: snap.changes.map(c => ({
+        status: c.status,
+        path: c.path,
+        oldPath: c.oldPath ?? '',
+        contentChanged: c.contentChanged ?? false,
+      })),
+    });
+  }
+
+  private async revealOpenMultiDiffTab(): Promise<boolean> {
+    await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
+      multiDiffSourceUri: this.multiDiffSourceUri,
+      title: `Plastic SCM: Changes (${this.lastSnapshot.branch || 'unknown'})`,
+      resources: this.lastSnapshot.changes.map(c => this.diffUris(c, `cs:${this.lastSnapshot.baseCs}`, null)),
+    });
+    return true;
   }
 
   // ---------- Path / URI helpers ----------
@@ -387,7 +432,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
   // ---------- Commands ----------
 
   /** Open Multi Diff Editor showing all pending changes. */
-  async viewAllChanges(): Promise<void> {
+  async viewAllChanges(forceReopen = false): Promise<void> {
     const t0 = Date.now();
     logDiag(`[scm] ──── viewAllChanges begin ────`);
 
@@ -425,13 +470,46 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       `(A=${byStatus.A} C=${byStatus.C} D=${byStatus.D} M=${byStatus.M} P=${byStatus.P}) baseCs=${snap.baseCs}`
     );
 
+    const resources = snap.changes.map(c =>
+      this.diffUris(c, `cs:${snap.baseCs}`, null)
+    );
+    const tResources = Date.now();
+    logDiag(`[scm] built ${resources.length} diff URI pairs in ${tResources - tRefresh}ms`);
+    const fingerprint = this.buildMultiDiffFingerprint(snap);
+
     const title = `Plastic SCM: Changes (${snap.branch || 'unknown'})`;
-    logDiag(`[scm] calling _workbench.openScmMultiDiffEditor`);
-    await vscode.commands.executeCommand('_workbench.openScmMultiDiffEditor', {
+    let shouldForceReopen = forceReopen;
+    if (this._multiDiffOpen && !shouldForceReopen) {
+      if (this.lastOpenedMultiDiffFingerprint === fingerprint) {
+        logDiag(`[scm] multi-diff already open with identical snapshot — reveal existing tab`);
+        await this.revealOpenMultiDiffTab();
+        return;
+      }
+      logDiag(`[scm] multi-diff open with changed snapshot — reopening to show latest view`);
+      shouldForceReopen = true;
+    }
+
+    if (this._multiDiffOpen && shouldForceReopen) {
+      const victims: vscode.Tab[] = [];
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          if (tab.label?.startsWith('Plastic SCM: Changes')) victims.push(tab);
+        }
+      }
+      if (victims.length > 0) {
+        await vscode.window.tabGroups.close(victims, true);
+      }
+      this._multiDiffOpen = false;
+    }
+
+    logDiag(`[scm] calling _workbench.openMultiDiffEditor`);
+    await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
+      multiDiffSourceUri: this.multiDiffSourceUri,
       title,
-      repositoryUri: vscode.Uri.file(this.workspaceRoot),
-      resourceGroupId: this.changesGroup.id,
+      resources,
     });
+    this._multiDiffOpen = true;
+    this.lastOpenedMultiDiffFingerprint = fingerprint;
     logDiag(`[scm] ──── viewAllChanges done in ${Date.now() - t0}ms ────`);
   }
 
