@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { ChangeStatus, EMPTY_REF, PlasticChange } from './types';
-import { toPlasticUri } from './plasticUri';
+import { parsePlasticUri, toPlasticUri } from './plasticUri';
 import {
   getPendingChangesRaw,
   filterPhantomChanges,
@@ -122,6 +122,17 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
         if (r.multiDiffEditorOriginalUri) {
           vscode.commands.executeCommand('vscode.open', r.multiDiffEditorOriginalUri);
         }
+      }),
+      vscode.commands.registerCommand('plasticDiff.openActiveModifiedFile', async () => {
+        const uri = vscode.window.activeTextEditor?.document.uri;
+        if (!uri || uri.scheme !== 'file') return;
+        await vscode.window.showTextDocument(uri, { preview: false });
+      }),
+      vscode.commands.registerCommand('plasticDiff.openActiveOriginalFile', async () => {
+        const uri = vscode.window.activeTextEditor?.document.uri;
+        if (!uri || uri.scheme !== 'plastic') return;
+        const { path: filePath } = parsePlasticUri(uri);
+        await vscode.window.showTextDocument(vscode.Uri.file(filePath), { preview: false });
       }),
       vscode.commands.registerCommand('plasticDiff.openDiff', (r: MultiDiffResourceState) => {
         if (r.command) {

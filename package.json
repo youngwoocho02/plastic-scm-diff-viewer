@@ -84,6 +84,18 @@
         "command": "plasticDiff.copyPath",
         "title": "Copy Path",
         "category": "Plastic SCM"
+      },
+      {
+        "command": "plasticDiff.openActiveModifiedFile",
+        "title": "Open File",
+        "category": "Plastic SCM",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "plasticDiff.openActiveOriginalFile",
+        "title": "Open Original File",
+        "category": "Plastic SCM",
+        "icon": "$(history)"
       }
     ],
     "menus": {
@@ -131,6 +143,30 @@
           "command": "plasticDiff.copyPath",
           "group": "9_misc@1",
           "when": "scmProvider == plastic"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "plasticDiff.openActiveModifiedFile",
+          "group": "navigation",
+          "when": "isInDiffEditor && isInDiffRightEditor && resourceScheme == file"
+        },
+        {
+          "command": "plasticDiff.openActiveOriginalFile",
+          "group": "navigation",
+          "when": "isInDiffEditor && !isInDiffRightEditor && resourceScheme == plastic"
+        }
+      ],
+      "multiDiffEditor/resource/title": [
+        {
+          "command": "plasticDiff.openFile",
+          "group": "navigation",
+          "when": "scmProvider == plastic && scmResourceState != plastic:D"
+        },
+        {
+          "command": "plasticDiff.openBaseRevision",
+          "group": "navigation",
+          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/"
         }
       ]
     },
