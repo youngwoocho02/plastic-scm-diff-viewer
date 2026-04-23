@@ -281,11 +281,10 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       await Promise.all([phantomPromise, prefetchPromise]);
       logDiag(`[refresh] stage2+3 parallel: ${Date.now() - tWarmStart}ms`);
 
-      if (this._multiDiffOpen && trigger !== 'auto') {
+      if (this._multiDiffOpen) {
         const nextFingerprint = this.buildMultiDiffFingerprint(this.lastSnapshot);
         if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
-          logDiag(`[refresh] multi-diff open — re-invoking viewAllChanges (trigger=${trigger})`);
-          void this.viewAllChanges(true);
+          logDiag(`[refresh] multi-diff open — snapshot changed but keeping current view (trigger=${trigger})`);
         } else {
           logDiag(`[refresh] multi-diff open but snapshot unchanged — skip reopen (trigger=${trigger})`);
         }

@@ -2,5 +2,6 @@ src/**
 scripts/**
 tsconfig.json
 .gitignore
+_upstream/**
 node_modules/**
 !dist/**
