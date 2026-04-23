@@ -50,6 +50,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
   readonly onDidChangeFileDecorations = this._onDidChangeDecorations.event;
   private readonly multiDiffSourceUri = vscode.Uri.parse('plastic-multi-diff:changes');
   private _multiDiffOpen = false;
+  private lastOpenedMultiDiffFingerprint: string | undefined;
 
   /** Set while Stage 2 (phantom filter) is still running. viewAllChanges
    *  awaits this so Multi Diff never opens with phantom files included. */
@@ -142,6 +143,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
         for (const tab of e.closed) {
           if (tab.label?.startsWith('Plastic SCM: Changes')) {
             this._multiDiffOpen = false;
+            this.lastOpenedMultiDiffFingerprint = undefined;
             break;
           }
         }
@@ -155,7 +157,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       })
     );
 
-    this.refresh();
+    this.refresh('startup');
   }
 
   private setupAutoRefresh(): void {
@@ -167,20 +169,20 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       .getConfiguration('plasticDiff')
       .get<number>('autoRefreshInterval', 10000);
     if (interval > 0) {
-      this.refreshTimer = setInterval(() => this.refresh(), interval);
+      this.refreshTimer = setInterval(() => this.refresh('auto'), interval);
     }
   }
 
   /** Single-flight refresh — concurrent callers share the in-flight promise. */
-  async refresh(): Promise<void> {
+  async refresh(trigger: 'auto' | 'manual' | 'startup' | 'config' | 'filter' = 'manual'): Promise<void> {
     if (this.refreshInflight) {
-      logDiag(`[refresh] join inflight`);
+      logDiag(`[refresh] join inflight (trigger=${trigger})`);
       return this.refreshInflight;
     }
-    logDiag(`[refresh] ──── begin ────`);
+    logDiag(`[refresh] ──── begin (trigger=${trigger}) ────`);
     this.refreshInflight = vscode.window.withProgress(
       { location: vscode.ProgressLocation.SourceControl },
-      () => this.doRefresh()
+      () => this.doRefresh(trigger)
     ).then(() => {}, (e) => { logDiag(`[refresh] progress error: ${e?.message}`); }) as Promise<void>;
     this.refreshInflight = this.refreshInflight.finally(() => {
       this.refreshInflight = undefined;
@@ -201,7 +203,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
    *
    * Running 2+3 in parallel reduces cold refresh from ~28s to ~20s.
    */
-  private async doRefresh(): Promise<void> {
+  private async doRefresh(trigger: 'auto' | 'manual' | 'startup' | 'config' | 'filter'): Promise<void> {
     const t0 = Date.now();
     try {
       // Stage 0: workspace info (branch + cs)
@@ -279,9 +281,14 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       await Promise.all([phantomPromise, prefetchPromise]);
       logDiag(`[refresh] stage2+3 parallel: ${Date.now() - tWarmStart}ms`);
 
-      if (this._multiDiffOpen) {
-        logDiag(`[refresh] multi-diff open — re-invoking viewAllChanges`);
-        this.viewAllChanges();
+      if (this._multiDiffOpen && trigger !== 'auto') {
+        const nextFingerprint = this.buildMultiDiffFingerprint(this.lastSnapshot);
+        if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
+          logDiag(`[refresh] multi-diff open — re-invoking viewAllChanges (trigger=${trigger})`);
+          void this.viewAllChanges(true);
+        } else {
+          logDiag(`[refresh] multi-diff open but snapshot unchanged — skip reopen (trigger=${trigger})`);
+        }
       }
 
       logDiag(`[refresh] ──── done in ${Date.now() - t0}ms ────`);
@@ -324,6 +331,19 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this._onDidChangeDecorations.fire(undefined);
 
     logDiag(`[refresh] committed snapshot: ${changes.length} items baseCs=${baseCs} filtered=${phantomFiltered}`);
+  }
+
+  private buildMultiDiffFingerprint(snap: typeof this.lastSnapshot): string {
+    return JSON.stringify({
+      baseCs: snap.baseCs,
+      branch: snap.branch,
+      changes: snap.changes.map(c => ({
+        status: c.status,
+        path: c.path,
+        oldPath: c.oldPath ?? '',
+        contentChanged: c.contentChanged ?? false,
+      })),
+    });
   }
 
   // ---------- Path / URI helpers ----------
@@ -412,7 +432,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
   // ---------- Commands ----------
 
   /** Open Multi Diff Editor showing all pending changes. */
-  async viewAllChanges(): Promise<void> {
+  async viewAllChanges(forceReopen = false): Promise<void> {
     const t0 = Date.now();
     logDiag(`[scm] ──── viewAllChanges begin ────`);
 
@@ -455,14 +475,25 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     );
     const tResources = Date.now();
     logDiag(`[scm] built ${resources.length} diff URI pairs in ${tResources - tRefresh}ms`);
+    const fingerprint = this.buildMultiDiffFingerprint(snap);
 
     const title = `Plastic SCM: Changes (${snap.branch || 'unknown'})`;
 
-    // VSCode caches the MultiDiffEditorInput keyed by multiDiffSourceUri — a
-    // plain re-invocation of _workbench.openMultiDiffEditor reuses the cached
-    // resources array and silently ignores the fresh one. Close the existing
-    // tab first so the reopen builds a new input.
-    if (this._multiDiffOpen) {
+    // VSCode caches the MultiDiffEditorInput keyed by multiDiffSourceUri, so a
+    // forced refresh must close/reopen to rebuild the input. When the current
+    // snapshot is unchanged, keep the existing editor instance and preserve
+    // its scroll position.
+    let shouldForceReopen = forceReopen;
+    if (this._multiDiffOpen && !shouldForceReopen) {
+      if (this.lastOpenedMultiDiffFingerprint === fingerprint) {
+        logDiag(`[scm] multi-diff already open with identical snapshot — skip reopen`);
+        return;
+      }
+      logDiag(`[scm] multi-diff open with changed snapshot — reopening to show latest view`);
+      shouldForceReopen = true;
+    }
+
+    if (this._multiDiffOpen && shouldForceReopen) {
       const tTabClose = Date.now();
       const victims: vscode.Tab[] = [];
       for (const group of vscode.window.tabGroups.all) {
@@ -487,6 +518,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     logDiag(`[scm] openMultiDiffEditor returned in ${tOpen - tResources}ms`);
 
     this._multiDiffOpen = true;
+    this.lastOpenedMultiDiffFingerprint = fingerprint;
     logDiag(`[scm] ──── viewAllChanges done in ${tOpen - t0}ms ────`);
   }
 
@@ -635,7 +667,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
           cfg.update(item.key, newVal, vscode.ConfigurationTarget.Workspace);
         }
       }
-      this.refresh();
+      this.refresh('filter');
     });
 
     qp.onDidHide(() => qp.dispose());
