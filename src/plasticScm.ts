@@ -36,7 +36,10 @@ type MultiDiffResourceState = vscode.SourceControlResourceState & {
 export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffProvider, vscode.FileDecorationProvider {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly sourceControl: vscode.SourceControl;
-  private readonly changesGroup: vscode.SourceControlResourceGroup;
+  private readonly addedGroup: vscode.SourceControlResourceGroup;
+  private readonly changedGroup: vscode.SourceControlResourceGroup;
+  private readonly deletedGroup: vscode.SourceControlResourceGroup;
+  private readonly privateGroup: vscode.SourceControlResourceGroup;
   private readonly contentProvider: PlasticContentProvider;
   private refreshTimer: ReturnType<typeof setInterval> | undefined;
   private refreshInflight: Promise<void> | undefined;
@@ -78,9 +81,21 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     this.sourceControl.quickDiffProvider = this;
     this.disposables.push(this.sourceControl);
 
-    this.changesGroup = this.sourceControl.createResourceGroup('changes', 'Changes');
-    this.changesGroup.hideWhenEmpty = true;
-    this.disposables.push(this.changesGroup);
+    this.addedGroup = this.sourceControl.createResourceGroup('added', 'Added');
+    this.addedGroup.hideWhenEmpty = true;
+    this.disposables.push(this.addedGroup);
+
+    this.changedGroup = this.sourceControl.createResourceGroup('changed', 'Changes');
+    this.changedGroup.hideWhenEmpty = true;
+    this.disposables.push(this.changedGroup);
+
+    this.deletedGroup = this.sourceControl.createResourceGroup('deleted', 'Deleted');
+    this.deletedGroup.hideWhenEmpty = true;
+    this.disposables.push(this.deletedGroup);
+
+    this.privateGroup = this.sourceControl.createResourceGroup('private', 'Untracked');
+    this.privateGroup.hideWhenEmpty = true;
+    this.disposables.push(this.privateGroup);
 
     this.contentProvider = new PlasticContentProvider(workspaceRoot);
     this.disposables.push(
@@ -320,7 +335,18 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     phantomFiltered: boolean,
   ): void {
     this.lastSnapshot = { changes, baseCs, branch, time: Date.now(), phantomFiltered };
-    this.changesGroup.resourceStates = changes.map(c => this.toResourceState(c, baseCs));
+    this.addedGroup.resourceStates = changes
+      .filter(c => c.status === ChangeStatus.Added)
+      .map(c => this.toResourceState(c, baseCs));
+    this.changedGroup.resourceStates = changes
+      .filter(c => c.status === ChangeStatus.Changed || c.status === ChangeStatus.Moved)
+      .map(c => this.toResourceState(c, baseCs));
+    this.deletedGroup.resourceStates = changes
+      .filter(c => c.status === ChangeStatus.Deleted)
+      .map(c => this.toResourceState(c, baseCs));
+    this.privateGroup.resourceStates = changes
+      .filter(c => c.status === ChangeStatus.Private)
+      .map(c => this.toResourceState(c, baseCs));
     this.sourceControl.count = changes.length;
     this.sourceControl.statusBarCommands = branch ? [
       { title: `$(git-branch) ${branch}`, command: 'plasticDiff.refresh', tooltip: 'Plastic SCM — click to refresh' },
