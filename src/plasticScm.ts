@@ -314,8 +314,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       if (this._multiDiffOpen) {
         const nextFingerprint = this.buildMultiDiffFingerprint(this.lastSnapshot);
         if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
-          logDiag(`[refresh] multi-diff open — snapshot changed, reopening view (trigger=${trigger})`);
-          await this.viewAllChanges(true);
+          logDiag(`[refresh] multi-diff open — snapshot changed but keeping current view (trigger=${trigger})`);
         } else {
           logDiag(`[refresh] multi-diff open but snapshot unchanged — skip reopen (trigger=${trigger})`);
         }
@@ -522,6 +521,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     const tResources = Date.now();
     logDiag(`[scm] built ${resources.length} diff URI pairs in ${tResources - tRefresh}ms`);
     const fingerprint = this.buildMultiDiffFingerprint(snap);
+
     const title = `Plastic SCM: Changes (${snap.branch || 'unknown'})`;
     let shouldForceReopen = forceReopen;
     if (this._multiDiffOpen && !shouldForceReopen) {
