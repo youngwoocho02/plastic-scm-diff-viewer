@@ -68,22 +68,26 @@
       {
         "command": "plasticDiff.openFile",
         "title": "Open File",
-        "category": "Plastic SCM"
+        "category": "Plastic SCM",
+        "icon": "$(go-to-file)"
       },
       {
         "command": "plasticDiff.openBaseRevision",
         "title": "Open Base Revision",
-        "category": "Plastic SCM"
+        "category": "Plastic SCM",
+        "icon": "$(history)"
       },
       {
         "command": "plasticDiff.openDiff",
         "title": "Open Diff",
-        "category": "Plastic SCM"
+        "category": "Plastic SCM",
+        "icon": "$(diff)"
       },
       {
         "command": "plasticDiff.copyPath",
         "title": "Copy Path",
-        "category": "Plastic SCM"
+        "category": "Plastic SCM",
+        "icon": "$(copy)"
       },
       {
         "command": "plasticDiff.openActiveFile",
@@ -120,7 +124,8 @@
         {
           "command": "plasticDiff.viewAllChanges",
           "group": "inline@1",
-          "when": "scmProvider == plastic"
+          "when": "scmProvider == plastic",
+          "icon": "$(diff-multiple)"
         }
       ],
       "scm/resourceState/context": [
@@ -132,12 +137,14 @@
         {
           "command": "plasticDiff.openFile",
           "group": "inline@1",
-          "when": "scmProvider == plastic && scmResourceState != plastic:D"
+          "when": "scmProvider == plastic && scmResourceState != plastic:D",
+          "icon": "$(go-to-file)"
         },
         {
           "command": "plasticDiff.openBaseRevision",
           "group": "inline@2",
-          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/"
+          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/",
+          "icon": "$(history)"
         },
         {
           "command": "plasticDiff.openFile",
