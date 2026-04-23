@@ -86,14 +86,14 @@
         "category": "Plastic SCM"
       },
       {
-        "command": "plasticDiff.openActiveModifiedFile",
+        "command": "plasticDiff.openActiveFile",
         "title": "Open File",
         "category": "Plastic SCM",
         "icon": "$(go-to-file)"
       },
       {
-        "command": "plasticDiff.openActiveOriginalFile",
-        "title": "Open Original File",
+        "command": "plasticDiff.openActiveBaseRevision",
+        "title": "Open Base Revision",
         "category": "Plastic SCM",
         "icon": "$(history)"
       }
@@ -131,6 +131,16 @@
         },
         {
           "command": "plasticDiff.openFile",
+          "group": "inline@1",
+          "when": "scmProvider == plastic && scmResourceState != plastic:D"
+        },
+        {
+          "command": "plasticDiff.openBaseRevision",
+          "group": "inline@2",
+          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/"
+        },
+        {
+          "command": "plasticDiff.openFile",
           "group": "navigation@2",
           "when": "scmProvider == plastic && scmResourceState != plastic:D"
         },
@@ -147,14 +157,14 @@
       ],
       "editor/title": [
         {
-          "command": "plasticDiff.openActiveModifiedFile",
+          "command": "plasticDiff.openActiveFile",
           "group": "navigation",
-          "when": "isInDiffEditor && isInDiffRightEditor && resourceScheme == file"
+          "when": "isInDiffEditor && resourceScheme =~ /^plastic$|^file$/"
         },
         {
-          "command": "plasticDiff.openActiveOriginalFile",
+          "command": "plasticDiff.openActiveBaseRevision",
           "group": "navigation",
-          "when": "isInDiffEditor && !isInDiffRightEditor && resourceScheme == plastic"
+          "when": "isInDiffEditor && resourceScheme == plastic"
         }
       ],
       "multiDiffEditor/resource/title": [

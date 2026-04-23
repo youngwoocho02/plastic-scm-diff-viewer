@@ -123,16 +123,21 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
           vscode.commands.executeCommand('vscode.open', r.multiDiffEditorOriginalUri);
         }
       }),
-      vscode.commands.registerCommand('plasticDiff.openActiveModifiedFile', async () => {
+      vscode.commands.registerCommand('plasticDiff.openActiveFile', async () => {
         const uri = vscode.window.activeTextEditor?.document.uri;
-        if (!uri || uri.scheme !== 'file') return;
-        await vscode.window.showTextDocument(uri, { preview: false });
+        if (!uri) return;
+        const target = uri.scheme === 'plastic'
+          ? vscode.Uri.file(parsePlasticUri(uri).path)
+          : uri.scheme === 'file'
+            ? uri
+            : undefined;
+        if (!target) return;
+        await vscode.window.showTextDocument(target, { preview: false });
       }),
-      vscode.commands.registerCommand('plasticDiff.openActiveOriginalFile', async () => {
+      vscode.commands.registerCommand('plasticDiff.openActiveBaseRevision', async () => {
         const uri = vscode.window.activeTextEditor?.document.uri;
         if (!uri || uri.scheme !== 'plastic') return;
-        const { path: filePath } = parsePlasticUri(uri);
-        await vscode.window.showTextDocument(vscode.Uri.file(filePath), { preview: false });
+        await vscode.commands.executeCommand('vscode.open', uri);
       }),
       vscode.commands.registerCommand('plasticDiff.openDiff', (r: MultiDiffResourceState) => {
         if (r.command) {
@@ -356,6 +361,15 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     });
   }
 
+  private async revealOpenMultiDiffTab(): Promise<boolean> {
+    await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
+      multiDiffSourceUri: this.multiDiffSourceUri,
+      title: `Plastic SCM: Changes (${this.lastSnapshot.branch || 'unknown'})`,
+      resources: this.lastSnapshot.changes.map(c => this.diffUris(c, `cs:${this.lastSnapshot.baseCs}`, null)),
+    });
+    return true;
+  }
+
   // ---------- Path / URI helpers ----------
 
   private absOf(p: string): string {
@@ -496,7 +510,8 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     let shouldForceReopen = forceReopen;
     if (this._multiDiffOpen && !shouldForceReopen) {
       if (this.lastOpenedMultiDiffFingerprint === fingerprint) {
-        logDiag(`[scm] multi-diff already open with identical snapshot — skip reopen`);
+        logDiag(`[scm] multi-diff already open with identical snapshot — reveal existing tab`);
+        await this.revealOpenMultiDiffTab();
         return;
       }
       logDiag(`[scm] multi-diff open with changed snapshot — reopening to show latest view`);
