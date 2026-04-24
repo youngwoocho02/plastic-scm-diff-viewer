@@ -2,7 +2,7 @@
   "name": "plastic-scm-diff-viewer",
   "displayName": "Plastic SCM Diff Viewer",
   "description": "Multi-file diff viewer for Plastic SCM (Unity Version Control) — view all changes in a single scrollable diff editor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "fedtop",
   "license": "MIT",
   "repository": {
