@@ -320,7 +320,9 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
 
       if (this._multiDiffOpen) {
         const nextFingerprint = this.buildMultiDiffFingerprint(this.lastSnapshot);
-        if (this.lastSnapshot.changes.length === 0) {
+        if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint && trigger === 'auto') {
+          logDiag(`[refresh] multi-diff open — latest snapshot available but not reopening during auto refresh`);
+        } else if (this.lastSnapshot.changes.length === 0) {
           logDiag(`[refresh] multi-diff open but snapshot is empty — closing stale tab (trigger=${trigger})`);
           await this.closeOpenMultiDiffTabs();
         } else if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
