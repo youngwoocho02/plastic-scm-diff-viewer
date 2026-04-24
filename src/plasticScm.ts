@@ -11,6 +11,7 @@ import {
   clearContentCache,
   prefetchBaseContent,
   logDiag,
+  undoPendingChange,
 } from './plasticCli';
 import { PlasticContentProvider } from './contentProvider';
 
@@ -139,6 +140,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
           vscode.commands.executeCommand(r.command.command, ...(r.command.arguments ?? []));
         }
       }),
+      vscode.commands.registerCommand('plasticDiff.revertChange', (r: MultiDiffResourceState) => this.revertChange(r)),
       vscode.commands.registerCommand('plasticDiff.copyPath', (r: MultiDiffResourceState) => {
         vscode.env.clipboard.writeText(r.resourceUri.fsPath);
       }),
@@ -476,6 +478,74 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
 
   // ---------- Commands ----------
 
+  private async closeOpenMultiDiffTabs(): Promise<void> {
+    const victims: vscode.Tab[] = [];
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        if (tab.label?.startsWith('Plastic SCM: Changes')) {
+          victims.push(tab);
+        }
+      }
+    }
+    if (victims.length > 0) {
+      await vscode.window.tabGroups.close(victims, true);
+    }
+    this._multiDiffOpen = false;
+    this.lastOpenedMultiDiffFingerprint = undefined;
+  }
+
+  private isPlasticMultiDiffActive(): boolean {
+    return vscode.window.tabGroups.activeTabGroup.activeTab?.label?.startsWith('Plastic SCM: Changes') === true;
+  }
+
+  private async revertChange(resource: MultiDiffResourceState): Promise<void> {
+    const change = this.changeByPath.get(resource.resourceUri.fsPath);
+    if (!change || change.status === ChangeStatus.Private) {
+      vscode.window.showErrorMessage('Plastic SCM: This change cannot be reverted from here.');
+      return;
+    }
+
+    const fileName = path.basename(change.path);
+    const isRestore = change.status === ChangeStatus.Deleted;
+    const message = isRestore
+      ? `Are you sure you want to restore '${fileName}'?`
+      : change.status === ChangeStatus.Added
+        ? `Are you sure you want to undo add for '${fileName}'?`
+        : `Are you sure you want to discard changes in '${fileName}'?`;
+    const confirm = isRestore
+      ? 'Restore File'
+      : change.status === ChangeStatus.Added
+        ? 'Undo Add'
+        : 'Discard File';
+
+    const pick = await vscode.window.showWarningMessage(message, { modal: true }, confirm);
+    if (pick !== confirm) {
+      return;
+    }
+
+    try {
+      const prevSnapshotTime = this.lastSnapshot.time;
+      const wasActiveMultiDiff = this.isPlasticMultiDiffActive();
+      await undoPendingChange(this.workspaceRoot, change);
+      await this.refresh();
+      if (this.lastSnapshot.time <= prevSnapshotTime) {
+        vscode.window.showWarningMessage('Plastic SCM: Change was reverted, but refresh did not complete. Refresh once more.');
+        return;
+      }
+      if (this._multiDiffOpen) {
+        if (this.lastSnapshot.changes.length === 0) {
+          await this.closeOpenMultiDiffTabs();
+        } else if (wasActiveMultiDiff) {
+          await this.viewAllChanges(true);
+        } else {
+          await this.closeOpenMultiDiffTabs();
+        }
+      }
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`Plastic SCM: Failed to revert '${fileName}': ${err.message}`);
+    }
+  }
+
   /** Open Multi Diff Editor showing all pending changes. */
   async viewAllChanges(forceReopen = false): Promise<void> {
     const t0 = Date.now();
@@ -535,16 +605,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     }
 
     if (this._multiDiffOpen && shouldForceReopen) {
-      const victims: vscode.Tab[] = [];
-      for (const group of vscode.window.tabGroups.all) {
-        for (const tab of group.tabs) {
-          if (tab.label?.startsWith('Plastic SCM: Changes')) victims.push(tab);
-        }
-      }
-      if (victims.length > 0) {
-        await vscode.window.tabGroups.close(victims, true);
-      }
-      this._multiDiffOpen = false;
+      await this.closeOpenMultiDiffTabs();
     }
 
     logDiag(`[scm] calling _workbench.openMultiDiffEditor`);

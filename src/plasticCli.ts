@@ -452,6 +452,18 @@ export async function getChangesetDiff(
   return changes;
 }
 
+// ---------- Pending change mutation ----------
+
+/** Revert a tracked pending change back to workspace base. */
+export async function undoPendingChange(cwd: string, change: PlasticChange): Promise<void> {
+  if (change.status === ChangeStatus.Private) {
+    throw new Error(`Cannot undo untracked file: ${change.path}`);
+  }
+
+  await exec(['undo', change.path], cwd);
+  log(`[undo] reverted ${change.status} ${change.path}`);
+}
+
 // ---------- File content ----------
 
 /** Get file content at a specific revision (cached). */

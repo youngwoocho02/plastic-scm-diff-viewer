@@ -84,6 +84,12 @@
         "icon": "$(diff)"
       },
       {
+        "command": "plasticDiff.revertChange",
+        "title": "Discard Change",
+        "category": "Plastic SCM",
+        "icon": "$(discard)"
+      },
+      {
         "command": "plasticDiff.copyPath",
         "title": "Copy Path",
         "category": "Plastic SCM",
@@ -147,6 +153,17 @@
           "icon": "$(history)"
         },
         {
+          "command": "plasticDiff.revertChange",
+          "group": "1_modification",
+          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[ACMD]/"
+        },
+        {
+          "command": "plasticDiff.revertChange",
+          "group": "inline@3",
+          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[ACMD]/",
+          "icon": "$(discard)"
+        },
+        {
           "command": "plasticDiff.openFile",
           "group": "navigation@2",
           "when": "scmProvider == plastic && scmResourceState != plastic:D"
@@ -184,6 +201,11 @@
           "command": "plasticDiff.openBaseRevision",
           "group": "navigation",
           "when": "scmProvider == plastic && scmResourceState =~ /plastic:[CMD]/"
+        },
+        {
+          "command": "plasticDiff.revertChange",
+          "group": "navigation",
+          "when": "scmProvider == plastic && scmResourceState =~ /plastic:[ACMD]/"
         }
       ]
     },
