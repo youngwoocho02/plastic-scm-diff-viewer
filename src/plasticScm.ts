@@ -20,6 +20,11 @@ interface DiffUris {
   modifiedUri: vscode.Uri;
 }
 
+interface MultiDiffRevealTarget {
+  modifiedUri: vscode.Uri;
+  range?: vscode.Range;
+}
+
 /** SourceControlResourceState extended with the proposed multi-diff fields. */
 type MultiDiffResourceState = vscode.SourceControlResourceState & {
   multiDiffEditorOriginalUri?: vscode.Uri;
@@ -315,8 +320,16 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
 
       if (this._multiDiffOpen) {
         const nextFingerprint = this.buildMultiDiffFingerprint(this.lastSnapshot);
-        if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
-          logDiag(`[refresh] multi-diff open — snapshot changed but keeping current view (trigger=${trigger})`);
+        if (this.lastSnapshot.changes.length === 0) {
+          logDiag(`[refresh] multi-diff open but snapshot is empty — closing stale tab (trigger=${trigger})`);
+          await this.closeOpenMultiDiffTabs();
+        } else if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
+          if (this.isPlasticMultiDiffActive()) {
+            logDiag(`[refresh] multi-diff active — reopening to latest snapshot (trigger=${trigger})`);
+            await this.reopenActiveMultiDiffToLatest();
+          } else {
+            logDiag(`[refresh] multi-diff open in background — keeping existing view (trigger=${trigger})`);
+          }
         } else {
           logDiag(`[refresh] multi-diff open but snapshot unchanged — skip reopen (trigger=${trigger})`);
         }
@@ -385,12 +398,69 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
   }
 
   private async revealOpenMultiDiffTab(): Promise<boolean> {
+    await this.openMultiDiffEditor(
+      this.lastSnapshot.changes.map(c => this.diffUris(c, `cs:${this.lastSnapshot.baseCs}`, null)),
+      `Plastic SCM: Changes (${this.lastSnapshot.branch || 'unknown'})`,
+    );
+    return true;
+  }
+
+  private activeMultiDiffRevealTarget(snap: typeof this.lastSnapshot): MultiDiffRevealTarget | undefined {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      return undefined;
+    }
+
+    const { uri } = editor.document;
+    const { selection } = editor;
+    const range = selection.isEmpty ? undefined : new vscode.Range(selection.start, selection.end);
+    if (uri.scheme === 'file') {
+      return { modifiedUri: uri, range };
+    }
+    if (uri.scheme !== 'plastic') {
+      return undefined;
+    }
+
+    const parsed = parsePlasticUri(uri);
+    const abs = this.absOf(parsed.path);
+    const change = snap.changes.find(c =>
+      this.absOf(c.path) === abs ||
+      (c.oldPath !== undefined && this.absOf(c.oldPath) === abs)
+    );
+    if (!change) {
+      return undefined;
+    }
+
+    return {
+      modifiedUri: this.diffUris(change, `cs:${snap.baseCs}`, null).modifiedUri,
+      range,
+    };
+  }
+
+  private async openMultiDiffEditor(
+    resources: DiffUris[],
+    title: string,
+    reveal?: MultiDiffRevealTarget,
+  ): Promise<void> {
     await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
       multiDiffSourceUri: this.multiDiffSourceUri,
-      title: `Plastic SCM: Changes (${this.lastSnapshot.branch || 'unknown'})`,
-      resources: this.lastSnapshot.changes.map(c => this.diffUris(c, `cs:${this.lastSnapshot.baseCs}`, null)),
+      title,
+      resources,
+      reveal: reveal ? {
+        modifiedUri: reveal.modifiedUri,
+        range: reveal.range,
+      } : undefined,
     });
-    return true;
+  }
+
+  private async reopenActiveMultiDiffToLatest(): Promise<void> {
+    const snap = this.lastSnapshot;
+    const resources = snap.changes.map(c => this.diffUris(c, `cs:${snap.baseCs}`, null));
+    const reveal = this.activeMultiDiffRevealTarget(snap);
+    await this.closeOpenMultiDiffTabs();
+    await this.openMultiDiffEditor(resources, `Plastic SCM: Changes (${snap.branch || 'unknown'})`, reveal);
+    this._multiDiffOpen = true;
+    this.lastOpenedMultiDiffFingerprint = this.buildMultiDiffFingerprint(snap);
   }
 
   // ---------- Path / URI helpers ----------
@@ -535,9 +605,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       if (this._multiDiffOpen) {
         if (this.lastSnapshot.changes.length === 0) {
           await this.closeOpenMultiDiffTabs();
-        } else if (wasActiveMultiDiff) {
-          await this.viewAllChanges(true);
-        } else {
+        } else if (!wasActiveMultiDiff) {
           await this.closeOpenMultiDiffTabs();
         }
       }
@@ -609,11 +677,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     }
 
     logDiag(`[scm] calling _workbench.openMultiDiffEditor`);
-    await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
-      multiDiffSourceUri: this.multiDiffSourceUri,
-      title,
-      resources,
-    });
+    await this.openMultiDiffEditor(resources, title);
     this._multiDiffOpen = true;
     this.lastOpenedMultiDiffFingerprint = fingerprint;
     logDiag(`[scm] ──── viewAllChanges done in ${Date.now() - t0}ms ────`);
