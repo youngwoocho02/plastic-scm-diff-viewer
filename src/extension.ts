@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { configure, isPlasticWorkspace, setCmPath, logDiag } from './plasticCli';
+import { configure, configureContentCache, isPlasticWorkspace, setCmPath, logDiag } from './plasticCli';
 import { PlasticScmProvider } from './plasticScm';
 
 let provider: PlasticScmProvider | undefined;
@@ -70,6 +70,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const root = roots[0];
   logDiag(`[activate] using root: ${root}`);
+  configureContentCache(context.globalStorageUri, root);
 
   provider = new PlasticScmProvider(root, context);
   context.subscriptions.push(provider);

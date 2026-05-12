@@ -10,7 +10,7 @@ Plastic SCM (Unity Version Control) 의 pending 변경 사항을 Git 스타일 d
 - **단일 파일 diff** — SCM 사이드바에서 파일 클릭 시 표준 diff 창
 - **Git 스타일 Added / Deleted 표시** — 추가된 파일은 "빈 상태 → 새 내용", 삭제된 파일은 "원본 → 빈 상태"
 - **지연 base 로딩** — diff로 연 파일의 historical content만 가져옴
-- **in-memory 콘텐츠 캐시** — 열었던 historical revision은 세션 내내 재사용
+- **관리형 콘텐츠 캐시** — 열었던 historical revision을 워크스페이스와 changeset 기준으로 VS Code 재시작 후에도 재사용
 - **Changeset diff** — 임의의 두 changeset 번호 간 비교
 - **자동 새로 고침** — 변경 목록이 워크스페이스 상태와 동기화 유지
 
@@ -56,7 +56,7 @@ code --install-extension plastic-scm-diff-viewer.vsix
 | `Plastic SCM: View All Changes (Multi Diff)` | 모든 pending 변경을 Multi Diff Editor에서 표시 |
 | `Plastic SCM: View Changeset Diff` | 두 changeset 번호를 입력해 비교 |
 | `Plastic SCM: Refresh` | 변경 목록 수동 새로 고침 |
-| `Plastic SCM: Clear Content Cache` | in-memory 캐시 삭제 (문제 진단용) |
+| `Plastic SCM: Clear Content Cache` | 메모리와 디스크 콘텐츠 캐시 삭제 (문제 진단용) |
 
 ## 설정
 
@@ -83,7 +83,7 @@ Plastic SCM은 **중앙집중형 VCS**다 — 히스토리는 워크스페이스
 - **Deleted** → `plastic://path?ref=cs:N` vs 빈 가상 문서
 - **Moved** → `plastic://oldPath?ref=cs:N` vs `file://newPath`
 
-`plastic://` URI 스킴은 `TextDocumentContentProvider`가 처리하며, query에서 `ref`를 추출해 열린 파일 하나에 대해서만 `cm cat` (캐시)을 호출한다.
+`plastic://` URI 스킴은 `TextDocumentContentProvider`가 처리하며, query에서 `ref`를 추출해 열린 파일 하나에 대해서만 `cm cat`을 호출한다. 결과는 메모리와 VS Code global storage에 캐시하며, 최근 사용한 changeset 캐시 폴더 10개만 유지한다.
 
 ### 동시성
 

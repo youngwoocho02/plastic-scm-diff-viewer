@@ -97,8 +97,8 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       vscode.commands.registerCommand('plasticDiff.viewAllChanges', () => this.viewAllChanges()),
       vscode.commands.registerCommand('plasticDiff.viewChangesetDiff', () => this.viewChangesetDiff()),
       vscode.commands.registerCommand('plasticDiff.refresh', () => this.refresh()),
-      vscode.commands.registerCommand('plasticDiff.clearCache', () => {
-        clearContentCache();
+      vscode.commands.registerCommand('plasticDiff.clearCache', async () => {
+        await clearContentCache();
         vscode.window.showInformationMessage('Plastic SCM: content cache cleared.');
       }),
       vscode.commands.registerCommand('plasticDiff.openFile', (r: MultiDiffResourceState) => {

@@ -10,7 +10,7 @@ VS Code extension for viewing Plastic SCM (Unity Version Control) pending change
 - **Single file diff** — click any file in the Source Control sidebar for a standard diff
 - **Git-style Added / Deleted views** — added files show "empty → new", deleted files show "old → empty"
 - **Lazy base loading** — historical content is fetched only for files opened in a diff
-- **In-memory content cache** — opened historical revisions are reused for the entire session
+- **Managed content cache** — opened historical revisions are reused across VS Code reloads, scoped by workspace and changeset
 - **Changeset diff** — compare any two changesets by number
 - **Auto refresh** — change list stays in sync with the workspace
 
@@ -56,7 +56,7 @@ Or build from source — see [Building](#building).
 | `Plastic SCM: View All Changes (Multi Diff)` | Open every pending change in the Multi Diff Editor |
 | `Plastic SCM: View Changeset Diff` | Compare two changesets by number |
 | `Plastic SCM: Refresh` | Manually refresh the change list |
-| `Plastic SCM: Clear Content Cache` | Drop the in-memory cache (troubleshooting only) |
+| `Plastic SCM: Clear Content Cache` | Drop the memory and disk content cache (troubleshooting only) |
 
 ## Configuration
 
@@ -83,7 +83,7 @@ Plastic SCM is a centralized VCS — historical content lives on a repository se
 - **Deleted** → `plastic://path?ref=cs:N` vs empty virtual document
 - **Moved** → `plastic://oldPath?ref=cs:N` vs `file://newPath`
 
-The `plastic://` URI scheme is served by a `TextDocumentContentProvider` that decodes the `ref` from the query string and calls `cm cat` for that opened file only (cached).
+The `plastic://` URI scheme is served by a `TextDocumentContentProvider` that decodes the `ref` from the query string and calls `cm cat` for that opened file only. Results are cached in memory and under VS Code global storage; only the 10 most recently used changeset cache folders are kept.
 
 ### Concurrency
 

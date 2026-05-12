@@ -2,6 +2,12 @@ import { execFile } from 'child_process';
 import * as vscode from 'vscode';
 import { ChangeStatus, PlasticChange, PlasticWorkspaceInfo } from './types';
 import { parseStatusOutput } from './statusParser';
+import {
+  clearDiskContentCache,
+  configureDiskContentCache,
+  readDiskContent,
+  writeDiskContent,
+} from './diskContentCache';
 
 // ---------- Module configuration (injected once at activation) ----------
 
@@ -15,6 +21,10 @@ export function configure(output: vscode.OutputChannel, cmPath: string): void {
 
 export function setCmPath(cmPath: string): void {
   _cmPath = cmPath;
+}
+
+export function configureContentCache(globalStorageUri: vscode.Uri, workspaceRoot: string): void {
+  configureDiskContentCache(globalStorageUri, workspaceRoot);
 }
 
 function timestamp(): string {
@@ -41,16 +51,17 @@ export function logDiag(msg: string): void {
 // revisions are immutable in Plastic — once committed, cs:N's content
 // never changes — so entries are never invalidated. New commits/branches
 // generate new keys naturally; old keys just sit unused.
-//
-// Lives only in memory (cleared on VSCode reload). Typical working set
-// is a few MB; no cap needed in practice.
+// Disk cache persists opened file contents across VS Code reloads.
 
 const _contentCache = new Map<string, Buffer>();
+let _cacheGeneration = 0;
+let _clearInProgress = 0;
 
 /** In-flight `cm cat` Promises keyed the same way as _contentCache.
  *  If a second request arrives for a key that's already being fetched,
  *  it shares the existing Promise instead of starting another cm cat. */
 const _inflight = new Map<string, Promise<Buffer>>();
+const _diskWrites = new Set<Promise<void>>();
 
 function normalizeCacheKeyPath(p: string): string {
   let s = p.replace(/\\/g, '/');
@@ -64,13 +75,22 @@ function cacheKey(filePath: string, ref: string): string {
   return `${ref}\x00${normalizeCacheKeyPath(filePath)}`;
 }
 
-/** Clear cache — exposed as a user command for troubleshooting.
- *  NOTE: in-flight promises are intentionally NOT cleared. If a fetch is
- *  currently running, its result will land in a freshly-empty cache and
- *  stay valid. Cancelling them would race against the execFile callbacks. */
-export function clearContentCache(): void {
+/** Clear cache — exposed as a user command for troubleshooting. */
+export async function clearContentCache(): Promise<void> {
+  _cacheGeneration++;
+  _clearInProgress++;
+  const pending = Array.from(_inflight.values());
+  _inflight.clear();
   _contentCache.clear();
-  log('content cache cleared');
+  try {
+    await Promise.allSettled(pending);
+    await Promise.allSettled(Array.from(_diskWrites));
+    _contentCache.clear();
+    await clearDiskContentCache();
+    log('content cache cleared');
+  } finally {
+    _clearInProgress--;
+  }
 }
 
 /**
@@ -85,8 +105,6 @@ async function catCached(cwd: string, filePath: string, ref: string): Promise<Bu
     return hit;
   }
 
-  // Coalesce concurrent misses for the same key — don't spawn a second
-  // cm cat while the first one is still in flight.
   const pending = _inflight.get(key);
   if (pending) {
     log(`[cache] WAIT ${ref} ${filePath} (joining in-flight)`);
@@ -94,16 +112,36 @@ async function catCached(cwd: string, filePath: string, ref: string): Promise<Bu
   }
 
   log(`[cache] MISS ${ref} ${filePath}`);
-  const promise = (async () => {
+  const generation = _cacheGeneration;
+  const mayPopulateCache = _clearInProgress === 0;
+  let promise!: Promise<Buffer>;
+  promise = (async () => {
     try {
+      const diskHit = await readDiskContent(ref, filePath);
+      if (diskHit) {
+        if (mayPopulateCache && _cacheGeneration === generation) {
+          _contentCache.set(key, diskHit);
+          log(`[cache] DISK ${ref} ${filePath} (${diskHit.length}B, size=${_contentCache.size})`);
+        }
+        return diskHit;
+      }
+
       const buf = await execBuffer(['cat', `${filePath}#${ref}`], cwd);
-      _contentCache.set(key, buf);
-      log(`[cache] STORE ${ref} ${filePath} (${buf.length}B, size=${_contentCache.size})`);
+      if (mayPopulateCache && _cacheGeneration === generation) {
+        _contentCache.set(key, buf);
+        const diskWrite = writeDiskContent(ref, filePath, buf)
+          .catch(e => log(`[cache] disk write failed ${ref} ${filePath}: ${e.message}`))
+          .finally(() => _diskWrites.delete(diskWrite));
+        _diskWrites.add(diskWrite);
+        log(`[cache] STORE ${ref} ${filePath} (${buf.length}B, size=${_contentCache.size})`);
+      }
       return buf;
     } finally {
       // Clear in-flight whether fetch succeeded or failed; failure cases
       // should retry on the next call rather than serve a cached error.
-      _inflight.delete(key);
+      if (_inflight.get(key) === promise) {
+        _inflight.delete(key);
+      }
     }
   })();
   _inflight.set(key, promise);

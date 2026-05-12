@@ -48,9 +48,10 @@ plasticScm.ts (SCM provider + 커맨드)
 
 plasticCli.ts (cm 프로세스 + 캐시)
   └─ enqueueCm — 4-slot 세마포어 (workspace lock 회피)
-  └─ catCached — 3단 lookup (cache → in-flight → new cm cat)
+  └─ catCached — 4단 lookup (memory cache → in-flight → disk cache → new cm cat)
   └─ _contentCache Map<ref\0path, Buffer> — immutable, 무효화 없음
-  └─ getFileContent — 열린 diff의 base content를 lazy fetch
+  └─ getFileContent — 열린 diff의 base content를 lazy fetch/cache
+  └─ diskContentCache — VS Code globalStorage 기반 changeset cache
 
 contentProvider.ts (VSCode 인터페이스)
   └─ plastic:// URI → parsePlasticUri → getFileContent → cache/cm cat
@@ -59,7 +60,7 @@ contentProvider.ts (VSCode 인터페이스)
 ## 주요 개념
 
 - **Phantom CH**: Plastic이 `CH`로 보고하지만 base와 byte-identical인 파일. Unity `.asset` checkout 흔적으로 흔함. 자동 refresh에서는 content 비교를 하지 않는다.
-- **Immutable 캐시**: historical revision은 Plastic에서 rewrite 안 되므로 `(ref, path)` 키는 세션 내내 유효. refresh·커밋·브랜치 스위치와 무관하게 재사용.
+- **Immutable 캐시**: historical revision은 Plastic에서 rewrite 안 되므로 `(ref, path)` 키는 유효. 메모리와 디스크 캐시가 refresh·커밋·브랜치 스위치와 무관하게 재사용한다.
 - **In-flight coalescing**: 동일 `ref\0path` 동시 호출은 단일 Promise 공유 → 같은 파일 중복 fetch 안 함.
 - **Status refresh**: refresh는 `cm status`만 사용한다. `cm cat`은 VS Code가 diff original document를 요청할 때만 실행한다.
 - **세마포어 4**: `cm`은 workspace lock을 잡음. 실측 결과 동시 cat 6+ 부터 flake. 4가 안전 ceiling.
@@ -161,11 +162,11 @@ VSCode에서 `View → Output → Plastic SCM Diff` 드롭다운 선택.
 |---|---|
 | Refresh | `cm status` 비용만 |
 | 첫 파일 diff 오픈 | `cm cat` 1회 비용 |
-| 캐시된 파일 diff 재오픈 | cache hit |
+| 캐시된 파일 diff 재오픈 | memory/disk cache hit |
 | `cm cat` 1회 | 2~4초 (네트워크 왕복, Unity DevOps Cloud) |
 
 **네트워크가 본질적 병목**. 줄이려면:
-- **D. 디스크 영구 캐시** — `context.globalStorageUri` 에 `(ref, path) → bytes` 저장. 세션 간 warm 유지.
+- 디스크 캐시는 `context.globalStorageUri/plastic-diff-cache/v1/<workspaceHash>/cs-<num>` 아래 최근 10개 changeset 폴더만 유지한다.
 - **cm shell 인터랙티브 모드** — 프로세스/연결 재사용. 복잡도 큼.
 
 ## 릴리즈 상태
