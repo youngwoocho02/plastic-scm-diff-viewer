@@ -9,8 +9,8 @@ Plastic SCM (Unity Version Control) 의 pending 변경 사항을 Git 스타일 d
 - **Multi Diff Editor** — 모든 pending 변경을 한 스크롤 뷰에서 (Git의 "Open All Changes"와 동일)
 - **단일 파일 diff** — SCM 사이드바에서 파일 클릭 시 표준 diff 창
 - **Git 스타일 Added / Deleted 표시** — 추가된 파일은 "빈 상태 → 새 내용", 삭제된 파일은 "원본 → 빈 상태"
-- **Phantom 필터** — Plastic이 Changed로 보고하지만 실제로는 base revision과 byte-identical인 파일 자동 제거 (Unity `.asset` checkout 흔적으로 흔히 발생)
-- **in-memory 콘텐츠 캐시** — historical revision은 immutable이므로 `cm cat` 결과를 세션 내내 재사용
+- **지연 base 로딩** — diff로 연 파일의 historical content만 가져옴
+- **in-memory 콘텐츠 캐시** — 열었던 historical revision은 세션 내내 재사용
 - **Changeset diff** — 임의의 두 changeset 번호 간 비교
 - **자동 새로 고침** — 변경 목록이 워크스페이스 상태와 동기화 유지
 
@@ -63,7 +63,7 @@ code --install-extension plastic-scm-diff-viewer.vsix
 | 설정 | 기본값 | 설명 |
 |---|---|---|
 | `plasticDiff.cmPath` | `cm` | `cm` CLI 실행 파일 경로 |
-| `plasticDiff.autoRefreshInterval` | `10000` | 자동 새로 고침 주기(ms). Plastic `cm status` 호출 때문에 warm refresh가 약 6초 걸림 — 8초 미만으로 설정하면 refresh가 큐에 쌓인다. `0`이면 자동 새로 고침 비활성화. |
+| `plasticDiff.autoRefreshInterval` | `10000` | 자동 새로 고침 주기(ms). 새로 고침은 변경 목록만 갱신하고, 파일 내용은 diff를 열 때 가져온다. `0`이면 자동 새로 고침 비활성화. |
 
 ## 동작 원리
 
@@ -74,8 +74,7 @@ Plastic SCM은 **중앙집중형 VCS**다 — 히스토리는 워크스페이스
 1. **`cm wi`** — 워크스페이스 루트 탐지
 2. **`cm status --header` + `cm gwp`** — 로드된 changeset 번호와 브랜치 읽기
 3. **`cm status --noheader --all --machinereadable --iscochanged`** — 모든 pending 변경 목록 (Added / Changed / Deleted / Moved)
-4. **Phantom 필터** — 각 `Changed` 항목에 대해 `cm cat path#cs:N` 을 병렬로 실행하고 워크스페이스 파일과 바이트 비교. 완전히 동일한 항목은 제거 (Plastic은 checkout 흔적만 있어도 Changed로 보고하므로)
-5. **Base 콘텐츠 prefetch** — Phantom 필터와 병렬로 실행. Added가 아닌 모든 항목의 base를 캐시에 미리 채워서 이후 Multi Diff 오픈이 즉시 완료되게 함
+4. Source Control 뷰를 status 결과만으로 갱신한다. 새로 고침 중에는 historical file content를 가져오지 않는다.
 
 ### Diff 렌더링
 
@@ -84,18 +83,18 @@ Plastic SCM은 **중앙집중형 VCS**다 — 히스토리는 워크스페이스
 - **Deleted** → `plastic://path?ref=cs:N` vs 빈 가상 문서
 - **Moved** → `plastic://oldPath?ref=cs:N` vs `file://newPath`
 
-`plastic://` URI 스킴은 `TextDocumentContentProvider`가 처리하며, query에서 `ref`를 추출해 `cm cat` (캐시)을 호출한다.
+`plastic://` URI 스킴은 `TextDocumentContentProvider`가 처리하며, query에서 `ref`를 추출해 열린 파일 하나에 대해서만 `cm cat` (캐시)을 호출한다.
 
 ### 동시성
 
 `cm`은 워크스페이스 레벨 락을 잡기 때문에, 확장은 모든 CLI 호출을 4-slot 세마포어로 관문을 걸어 직렬화한다. 이 값은 실측으로 결정 — `limit=4` 는 실전에서 100% 안정, `limit=6` 은 단독 벤치에선 되지만 `cm status` 와 동시 부하가 걸리면 flake.
 
-동일한 `path#ref` 키에 대한 동시 호출은 단일 in-flight Promise로 합쳐져서, phantom 필터와 prefetch가 중복 작업을 하지 않는다.
+동일한 `path#ref` 키에 대한 동시 호출은 단일 in-flight Promise로 합쳐져서, 반복 diff 오픈이 중복 작업을 하지 않는다.
 
 ## 알려진 한계
 
-- **첫 cold refresh 가 느림 (~20초)** — 원격 repository 기준. `cm cat` 왕복이 지배적이며, 로컬 Plastic 미러(`cm replicate`) 나 `cm shell` 인터랙티브 모드 없이는 줄일 수 없음
-- **Moved 파일 원본 경로 유실** — `cm status --machinereadable` 이 `MV`/`LM` 항목의 원본 경로를 제공하지 않음. 현재는 self-diff 로 렌더
+- **파일 diff 첫 오픈이 느릴 수 있음** — 원격 repository 기준 `cm cat`이 historical content를 가져오기 때문
+- **Phantom Changed 항목** — refresh 중 모든 파일을 base와 바이트 비교하지 않으므로 일부 checkout 흔적이 표시될 수 있음
 - **바이너리 파일** — UTF-8 문자열로 디코드되어 나타남. 비-텍스트 파일은 깨져 보일 수 있음
 - **멀티 루트 워크스페이스** — 탐지된 첫 Plastic 루트만 모니터링
 

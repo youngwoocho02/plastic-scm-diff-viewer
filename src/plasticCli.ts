@@ -1,6 +1,4 @@
 import { execFile } from 'child_process';
-import * as fs from 'fs/promises';
-import * as path from 'path';
 import * as vscode from 'vscode';
 import { ChangeStatus, PlasticChange, PlasticWorkspaceInfo } from './types';
 import { parseStatusOutput } from './statusParser';
@@ -76,37 +74,6 @@ export function clearContentCache(): void {
 }
 
 /**
- * Warm the cache for every change that has a base revision so the Multi Diff
- * Editor opens instantly. Added has no base → skipped. Changed is typically
- * already cached by the phantom filter but we re-call `catCached` (it's a
- * cache hit — no cost) to keep the logic uniform.
- */
-export async function prefetchBaseContent(
-  cwd: string,
-  baseCs: number,
-  changes: PlasticChange[],
-): Promise<void> {
-  const t0 = Date.now();
-  const ref = `cs:${baseCs}`;
-  const eligible = changes.filter(c => c.status !== ChangeStatus.Added && c.status !== ChangeStatus.Private);
-  log(`[prefetch] start: ${eligible.length} non-Added items`);
-  let ok = 0, fail = 0;
-  await Promise.all(eligible.map(async c => {
-    // Base content lives at oldPath when set (Moved entries, or CH children
-    // of a directory-move whose base path differs from the current path).
-    const basePath = c.oldPath ?? c.path;
-    try {
-      await catCached(cwd, basePath, ref);
-      ok++;
-    } catch (e: any) {
-      fail++;
-      log(`[prefetch] fail ${basePath}: ${e.message}`);
-    }
-  }));
-  log(`[prefetch] done: ${ok} ok, ${fail} fail in ${Date.now() - t0}ms`);
-}
-
-/**
  * Fetch base content at a specific revision, with caching.
  * All `cm cat` calls in the extension should go through this.
  */
@@ -145,15 +112,8 @@ async function catCached(cwd: string, filePath: string, ref: string): Promise<Bu
 
 // ---------- cm process execution ----------
 //
-// Plastic's `cm` takes a workspace-level lock. Standalone bench of 13
-// cm cat calls showed limit=6 was 100% reliable. But in production,
-// Stage 2+3 parallel runs ~24 cm cats IMMEDIATELY after `cm status --all`
-// releases its lock — the combined load crosses the contention threshold
-// and fails with "The workspace is busy. Try later".
-//
-// Observed (real cold refresh, limit=6):
-//   stage1 raw status      : 6.6s  (usually 2-4s, slowed by competing load)
-//   phantom/prefetch fail  : 1 file hit "workspace busy"
+// Plastic's `cm` takes a workspace-level lock. Diff opens can request several
+// original documents at once, so `cm cat` calls still go through a semaphore.
 //
 // Bench numbers (standalone, 13 cm cat only):
 //   limit=1  → 38s,   100% ok
@@ -242,15 +202,12 @@ function execBuffer(args: string[], cwd: string): Promise<Buffer> {
  * Get pending workspace changes via `cm status`.
  *
  * `cm status` is the ONLY way Plastic exposes workspace-vs-base diffs
- * (`cm diff cs:N` is parent→cs:N history). Status over-reports though —
- * byte-identical files are sometimes marked `CH` (phantom), so we run a
- * content comparison afterwards to drop them.
+ * (`cm diff cs:N` is parent→cs:N history). It may over-report phantom `CH`
+ * entries; refresh intentionally does not fetch file content to verify them.
  *
  * Output format with `--iscochanged --fieldseparator=\t`:
  *   STATUS TAB ABS_PATH TAB ISDIR TAB MERGEINFO
  */
-/** Stage 1 of pending-change fetch: raw `cm status` + parse, no phantom filter.
- *  Use `filterPhantomChanges` separately to drop byte-identical entries. */
 export async function getPendingChangesRaw(cwd: string, baseCs: number): Promise<PlasticChange[]> {
   if (baseCs <= 0) {
     log(`[status] skipped — baseCs=${baseCs}`);
@@ -277,123 +234,6 @@ export async function getPendingChangesRaw(cwd: string, baseCs: number): Promise
   );
 
   return parsed;
-}
-
-/**
- * Drop phantom Changed entries — files reported as `C` but byte-identical
- * to the base revision. Plastic does this for config files whose metadata
- * was touched by checkout without real content edits.
- */
-export async function filterPhantomChanges(
-  cwd: string,
-  baseCs: number,
-  changes: PlasticChange[],
-): Promise<PlasticChange[]> {
-  const t0 = Date.now();
-  const ref = `cs:${baseCs}`;
-  const changedCount = changes.filter(c => c.status === ChangeStatus.Changed).length;
-  log(`[phantom] start: ${changedCount} Changed to verify`);
-  let dropped = 0;
-  const keep = await Promise.all(changes.map(async c => {
-    if (c.status !== ChangeStatus.Changed) return true;
-    const abs = path.isAbsolute(c.path) ? c.path : path.join(cwd, c.path);
-    const basePath = c.oldPath ?? c.path;
-    try {
-      const [baseBuf, workBuf] = await Promise.all([
-        catCached(cwd, basePath, ref),
-        fs.readFile(abs),
-      ]);
-      const identical = baseBuf.equals(workBuf);
-      if (identical) {
-        dropped++;
-        log(`[phantom] drop ${c.path} (${baseBuf.length}B identical)`);
-      }
-      return !identical;
-    } catch (e: any) {
-      log(`[phantom] fail ${c.path}: ${e.message}`);
-      return true;
-    }
-  }));
-  const result = changes.filter((_, i) => keep[i]);
-  log(`[phantom] done: dropped ${dropped}/${changedCount} in ${Date.now() - t0}ms`);
-  return result;
-}
-
-// ---------- Trivial-change filter (semantic) ----------
-//
-// Drop Changed entries whose only differences are using directives,
-// namespace declarations, line comments, or whitespace. C# only for now.
-//
-// Conservative — when in doubt, keep the file:
-//   - line comments only stripped when the line has no `"` (string-literal safe)
-//   - block comments are NOT stripped (avoids `"…/*…*/…"` corruption)
-//   - using-directive regex requires the rhs to be a dotted identifier or an
-//     alias `X = Type`, both excluding `(`/`{`. C# 8 `using var x = Foo();`
-//     and `using (var x = …) { … }` therefore do NOT match → kept.
-//   - lone braces dropped so `namespace X { … }` wrap/unwrap is trivial
-//   - `namespace` lines dropped (handles both block-scoped and file-scoped)
-
-function normalizeCSharp(text: string): string {
-  const out: string[] = [];
-  for (let raw of text.split(/\r?\n/)) {
-    let line = raw;
-    if (line.indexOf('"') === -1) {
-      const ci = line.indexOf('//');
-      if (ci !== -1) line = line.slice(0, ci);
-    }
-    line = line.trim();
-    if (!line) continue;
-    if (line === '{' || line === '}') continue;
-    if (/^using\s+(static\s+)?[\w.]+\s*;$/.test(line)) continue;
-    if (/^using\s+[\w.]+\s*=\s*[\w.<>,\s]+;$/.test(line)) continue;
-    if (/^namespace\b/.test(line)) continue;
-    out.push(line);
-  }
-  return out.join('\n');
-}
-
-/**
- * Drop Changed entries whose only diff is using/namespace/comment/whitespace.
- * Runs after phantom filter; reuses the same content cache.
- */
-export async function filterTrivialChanges(
-  cwd: string,
-  baseCs: number,
-  changes: PlasticChange[],
-): Promise<PlasticChange[]> {
-  const t0 = Date.now();
-  const ref = `cs:${baseCs}`;
-  const targets = changes.filter(
-    c => c.status === ChangeStatus.Changed && c.path.toLowerCase().endsWith('.cs')
-  );
-  log(`[trivial] start: ${targets.length} .cs Changed to verify`);
-  let dropped = 0;
-  const keep = await Promise.all(changes.map(async c => {
-    if (c.status !== ChangeStatus.Changed) return true;
-    if (!c.path.toLowerCase().endsWith('.cs')) return true;
-    const abs = path.isAbsolute(c.path) ? c.path : path.join(cwd, c.path);
-    const basePath = c.oldPath ?? c.path;
-    try {
-      const [baseBuf, workBuf] = await Promise.all([
-        catCached(cwd, basePath, ref),
-        fs.readFile(abs),
-      ]);
-      const baseN = normalizeCSharp(baseBuf.toString('utf8'));
-      const workN = normalizeCSharp(workBuf.toString('utf8'));
-      if (baseN === workN) {
-        dropped++;
-        log(`[trivial] drop ${c.path} (using/namespace/comment-only)`);
-        return false;
-      }
-      return true;
-    } catch (e: any) {
-      log(`[trivial] fail ${c.path}: ${e.message}`);
-      return true;
-    }
-  }));
-  const result = changes.filter((_, i) => keep[i]);
-  log(`[trivial] done: dropped ${dropped}/${targets.length} in ${Date.now() - t0}ms`);
-  return result;
 }
 
 // ---------- Changeset diff (cm diff cs:X cs:Y) ----------
@@ -473,7 +313,7 @@ export async function getFileContent(cwd: string, filePath: string, ref: string)
     return buf.toString('utf8');
   } catch (e: any) {
     log(`cat ${filePath}#${ref} failed: ${e.message}`);
-    return '';
+    throw e;
   }
 }
 

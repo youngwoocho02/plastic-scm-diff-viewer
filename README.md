@@ -9,8 +9,8 @@ VS Code extension for viewing Plastic SCM (Unity Version Control) pending change
 - **Multi Diff Editor** — every pending change in one scrollable view, like Git's "Open All Changes"
 - **Single file diff** — click any file in the Source Control sidebar for a standard diff
 - **Git-style Added / Deleted views** — added files show "empty → new", deleted files show "old → empty"
-- **Phantom filter** — drops files that Plastic marks as Changed but are byte-identical to the base revision (common with Unity `.asset` checkout artifacts)
-- **In-memory content cache** — historical revisions are immutable, so `cm cat` results are reused for the entire session
+- **Lazy base loading** — historical content is fetched only for files opened in a diff
+- **In-memory content cache** — opened historical revisions are reused for the entire session
 - **Changeset diff** — compare any two changesets by number
 - **Auto refresh** — change list stays in sync with the workspace
 
@@ -63,7 +63,7 @@ Or build from source — see [Building](#building).
 | Setting | Default | Description |
 |---|---|---|
 | `plasticDiff.cmPath` | `cm` | Path to the `cm` CLI executable |
-| `plasticDiff.autoRefreshInterval` | `10000` | Auto-refresh interval in ms. Warm refresh takes ~6s due to Plastic `cm status` calls; intervals below ~8s cause refreshes to queue. Set to `0` to disable auto-refresh. |
+| `plasticDiff.autoRefreshInterval` | `10000` | Auto-refresh interval in ms. Refresh lists changes only; file content is fetched when a diff is opened. Set to `0` to disable auto-refresh. |
 
 ## How It Works
 
@@ -74,8 +74,7 @@ Plastic SCM is a centralized VCS — historical content lives on a repository se
 1. **`cm wi`** — detect the workspace root.
 2. **`cm status --header` + `cm gwp`** — read the loaded changeset number and branch.
 3. **`cm status --noheader --all --machinereadable --iscochanged`** — list every pending change (Added / Changed / Deleted / Moved).
-4. **Phantom filter** — for each `Changed` entry, run `cm cat path#cs:N` in parallel and compare bytes with the workspace file. Drop entries that are byte-identical (Plastic reports these as changed even when the content wasn't touched, usually after a checkout-only operation).
-5. **Base-content prefetch** — runs in parallel with the phantom filter. Warms the cache for every non-Added item so later Multi Diff opens are instant.
+4. The Source Control view is updated from status only. No historical file content is fetched during refresh.
 
 ### Diff rendering
 
@@ -84,18 +83,18 @@ Plastic SCM is a centralized VCS — historical content lives on a repository se
 - **Deleted** → `plastic://path?ref=cs:N` vs empty virtual document
 - **Moved** → `plastic://oldPath?ref=cs:N` vs `file://newPath`
 
-The `plastic://` URI scheme is served by a `TextDocumentContentProvider` that decodes the `ref` from the query string and calls `cm cat` (cached).
+The `plastic://` URI scheme is served by a `TextDocumentContentProvider` that decodes the `ref` from the query string and calls `cm cat` for that opened file only (cached).
 
 ### Concurrency
 
 `cm` holds a workspace-level lock, so the extension gates every CLI invocation through a 4-wide semaphore. The limit was chosen by measurement — `limit=4` is reliable in production, `limit=6` works on isolated benchmarks but flakes under concurrent `cm status` load.
 
-Concurrent calls for the same `path#ref` key are coalesced into a single in-flight promise, so phantom filter and prefetch never duplicate work.
+Concurrent calls for the same `path#ref` key are coalesced into a single in-flight promise, so repeated diff opens never duplicate work.
 
 ## Known Limitations
 
-- **First cold refresh is slow (~20s)** on a remote repository. Each `cm cat` roundtrip dominates; there's no way to avoid it without either a local Plastic mirror (`cm replicate`) or `cm shell` interactive mode.
-- **Moved files lose their original path** because `cm status --machinereadable` doesn't expose it for `MV`/`LM` items. Currently rendered as a self-diff.
+- **First open of a file diff can be slow** on a remote repository because `cm cat` fetches historical content over the network.
+- **Phantom Changed entries** may appear because refresh no longer fetches every file to compare bytes with the base revision.
 - **Binary files** are rendered as UTF-8 decoded strings — non-text files may appear garbled.
 - **Multi-root workspaces** — only the first detected Plastic root is monitored.
 

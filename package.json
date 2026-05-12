@@ -217,11 +217,6 @@
           "default": "cm",
           "description": "Path to the Plastic SCM 'cm' CLI executable"
         },
-        "plasticDiff.hideTrivialChanges": {
-          "type": "boolean",
-          "default": true,
-          "description": "Hide Changed .cs files whose only diff is using directives, namespace declarations, comments, or whitespace. Conservative — when in doubt, the file is kept."
-        },
         "plasticDiff.hidePureRenames": {
           "type": "boolean",
           "default": true,
@@ -235,8 +230,8 @@
         "plasticDiff.autoRefreshInterval": {
           "type": "number",
           "default": 10000,
-          "minimum": 1000,
-          "description": "Auto-refresh interval in milliseconds (0 to disable). Warm refresh takes ~6s due to Plastic cm status calls; intervals below ~8s cause refreshes to queue."
+          "minimum": 0,
+          "description": "Auto-refresh interval in milliseconds (0 to disable). Refresh lists changes only; file content is fetched when a diff is opened."
         }
       }
     }

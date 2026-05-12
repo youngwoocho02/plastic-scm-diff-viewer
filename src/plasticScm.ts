@@ -4,12 +4,9 @@ import { ChangeStatus, EMPTY_REF, PlasticChange } from './types';
 import { parsePlasticUri, toPlasticUri } from './plasticUri';
 import {
   getPendingChangesRaw,
-  filterPhantomChanges,
-  filterTrivialChanges,
   getWorkspaceInfo,
   getChangesetDiff,
   clearContentCache,
-  prefetchBaseContent,
   logDiag,
   undoPendingChange,
 } from './plasticCli';
@@ -18,11 +15,6 @@ import { PlasticContentProvider } from './contentProvider';
 interface DiffUris {
   originalUri: vscode.Uri;
   modifiedUri: vscode.Uri;
-}
-
-interface MultiDiffRevealTarget {
-  modifiedUri: vscode.Uri;
-  range?: vscode.Range;
 }
 
 /** SourceControlResourceState extended with the proposed multi-diff fields. */
@@ -35,9 +27,8 @@ type MultiDiffResourceState = vscode.SourceControlResourceState & {
  * Read-only Plastic SCM integration: shows pending changes in the SCM view
  * and provides Git-style diffs (single-click + multi-diff editor).
  *
- * Data source is `cm diff cs:<loaded>` (real content diffs only) — Plastic's
- * `cm status` is NOT used for the change list because it reports phantom CH
- * for byte-identical files.
+ * Data source is `cm status`; historical content is fetched only for files
+ * VS Code actually opens in a diff.
  */
 export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffProvider, vscode.FileDecorationProvider {
   private readonly disposables: vscode.Disposable[] = [];
@@ -57,21 +48,15 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
   private _multiDiffOpen = false;
   private lastOpenedMultiDiffFingerprint: string | undefined;
 
-  /** Set while Stage 2 (phantom filter) is still running. viewAllChanges
-   *  awaits this so Multi Diff never opens with phantom files included. */
-  private phantomInflight: Promise<void> | undefined;
-
   /** Most recent fetch result — reused by viewAllChanges.
    *  All fields are swapped together so viewAllChanges can never read
-   *  an old baseCs with new changes. `phantomFiltered` distinguishes a
-   *  Stage 1 commit (raw, phantoms included) from a Stage 2 commit. */
+   *  an old baseCs with new changes. */
   private lastSnapshot: {
     changes: PlasticChange[];
     baseCs: number;
     branch: string;
     time: number;
-    phantomFiltered: boolean;
-  } = { changes: [], baseCs: 0, branch: '', time: 0, phantomFiltered: false };
+  } = { changes: [], baseCs: 0, branch: '', time: 0 };
 
   constructor(
     private readonly workspaceRoot: string,
@@ -227,111 +212,31 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     return this.refreshInflight;
   }
 
-  /**
-   * Refresh stages:
-   *   0. info (~2s cold)          — workspace info (cs + branch)
-   *   1. status (~4s cold)         — raw parse, commit snapshot (phantoms included)
-   *   2+3 parallel (~18s cold)     — phantom filter + prefetch concurrently
-   *        - Phantom filter drops byte-identical entries; commit filtered snapshot.
-   *        - Prefetch warms base content for every non-Added item.
-   *        - Both share the same cm semaphore + `_inflight` cache, so Changed
-   *          items fetched by the phantom filter are naturally shared with
-   *          prefetch via in-flight coalescing (no duplicate cm cat).
-   *
-   * Running 2+3 in parallel reduces cold refresh from ~28s to ~20s.
-   */
+  /** Refresh only lists pending changes. Historical file content is fetched lazily
+   *  when VS Code asks for the original side of an opened diff. */
   private async doRefresh(trigger: 'auto' | 'manual' | 'startup' | 'config' | 'filter'): Promise<void> {
     const t0 = Date.now();
     try {
-      // Stage 0: workspace info (branch + cs)
       const tInfoStart = Date.now();
       const info = await getWorkspaceInfo(this.workspaceRoot);
       logDiag(`[refresh] stage0 info: ${Date.now() - tInfoStart}ms (cs=${info?.changeset} branch=${info?.branch})`);
       const baseCs = info?.changeset ?? 0;
       const branch = info?.branch ?? '';
 
-      // Stage 1: raw pending changes (phantoms included) — commit immediately
-      // with phantomFiltered=false so viewAllChanges knows to wait.
       const tRawStart = Date.now();
       const raw = await getPendingChangesRaw(this.workspaceRoot, baseCs);
-      logDiag(`[refresh] stage1 raw status: ${Date.now() - tRawStart}ms (${raw.length} items, phantoms included)`);
-      // Only commit the raw (unfiltered) snapshot on the very first load —
-      // refreshing an already-populated SCM panel with raw then filtered
-      // produces a visible "list grows then shrinks" flicker every cycle.
-      if (this.lastSnapshot.time === 0) {
-        this.commitSnapshot(raw, baseCs, branch, false);
-      }
+      logDiag(`[refresh] status: ${Date.now() - tRawStart}ms (${raw.length} items)`);
 
-      // Stage 2 + 3 in parallel:
-      //   - Phantom filter: drop byte-identical Changed → recommit snapshot
-      //   - Prefetch:       warm base content for all non-Added
-      // Both go through the same semaphore; Changed items fetched by phantom
-      // are shared with prefetch via in-flight coalescing.
-      const tWarmStart = Date.now();
-
-      // Track phantom separately so viewAllChanges can await JUST the phantom
-      // stage (which determines correctness of the change list) without having
-      // to also wait for prefetch (which only affects cache warmth).
-      const phantomPromise = (async () => {
-        const tStart = Date.now();
-        let filtered = await filterPhantomChanges(this.workspaceRoot, baseCs, raw);
-        logDiag(`[refresh] phantom: ${Date.now() - tStart}ms (${filtered.length} kept, ${raw.length - filtered.length} dropped)`);
-
-        const cfg = vscode.workspace.getConfiguration('plasticDiff');
-        const hideTrivial = cfg.get<boolean>('hideTrivialChanges', true);
-        if (hideTrivial) {
-          const tT = Date.now();
-          const before = filtered.length;
-          filtered = await filterTrivialChanges(this.workspaceRoot, baseCs, filtered);
-          logDiag(`[refresh] trivial: ${Date.now() - tT}ms (${filtered.length} kept, ${before - filtered.length} dropped)`);
-        }
-
-        const hidePureRenames = cfg.get<boolean>('hidePureRenames', true);
-        if (hidePureRenames) {
-          const before = filtered.length;
-          filtered = filtered.filter(c => !(c.status === ChangeStatus.Moved && !c.contentChanged));
-          logDiag(`[refresh] pure-rename: ${filtered.length} kept, ${before - filtered.length} dropped`);
-        }
-
-        const hideMeta = cfg.get<boolean>('hideMetaFiles', true);
-        if (hideMeta) {
-          const before = filtered.length;
-          filtered = filtered.filter(c => !c.path.toLowerCase().endsWith('.meta'));
-          logDiag(`[refresh] meta: ${filtered.length} kept, ${before - filtered.length} dropped`);
-        }
-
-        this.commitSnapshot(filtered, baseCs, branch, true);
-      })();
-      this.phantomInflight = phantomPromise.finally(() => {
-        this.phantomInflight = undefined;
-      });
-
-      const prefetchPromise = (async () => {
-        const tStart = Date.now();
-        // Pass `raw`, not filtered — phantom filter runs in parallel so the
-        // filtered list isn't available yet. For Changed items, catCached will
-        // hit the in-flight Promise from phantom filter (no duplicate fetch).
-        await prefetchBaseContent(this.workspaceRoot, baseCs, raw);
-        logDiag(`[refresh] prefetch: ${Date.now() - tStart}ms`);
-      })();
-
-      await Promise.all([phantomPromise, prefetchPromise]);
-      logDiag(`[refresh] stage2+3 parallel: ${Date.now() - tWarmStart}ms`);
+      const filtered = this.applyCheapFilters(raw);
+      this.commitSnapshot(filtered, baseCs, branch);
 
       if (this._multiDiffOpen) {
         const nextFingerprint = this.buildMultiDiffFingerprint(this.lastSnapshot);
-        if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint && trigger === 'auto') {
-          logDiag(`[refresh] multi-diff open — latest snapshot available but not reopening during auto refresh`);
-        } else if (this.lastSnapshot.changes.length === 0) {
+        if (this.lastSnapshot.changes.length === 0) {
           logDiag(`[refresh] multi-diff open but snapshot is empty — closing stale tab (trigger=${trigger})`);
           await this.closeOpenMultiDiffTabs();
         } else if (this.lastOpenedMultiDiffFingerprint !== nextFingerprint) {
-          if (this.isPlasticMultiDiffActive()) {
-            logDiag(`[refresh] multi-diff active — reopening to latest snapshot (trigger=${trigger})`);
-            await this.reopenActiveMultiDiffToLatest();
-          } else {
-            logDiag(`[refresh] multi-diff open in background — keeping existing view (trigger=${trigger})`);
-          }
+          logDiag(`[refresh] multi-diff open — latest snapshot available; not reopening during refresh`);
         } else {
           logDiag(`[refresh] multi-diff open but snapshot unchanged — skip reopen (trigger=${trigger})`);
         }
@@ -349,9 +254,8 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     changes: PlasticChange[],
     baseCs: number,
     branch: string,
-    phantomFiltered: boolean,
   ): void {
-    this.lastSnapshot = { changes, baseCs, branch, time: Date.now(), phantomFiltered };
+    this.lastSnapshot = { changes, baseCs, branch, time: Date.now() };
     this.addedGroup.resourceStates = changes
       .filter(c => c.status === ChangeStatus.Added)
       .map(c => this.toResourceState(c, baseCs));
@@ -383,7 +287,26 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     }
     this._onDidChangeDecorations.fire(undefined);
 
-    logDiag(`[refresh] committed snapshot: ${changes.length} items baseCs=${baseCs} filtered=${phantomFiltered}`);
+    logDiag(`[refresh] committed snapshot: ${changes.length} items baseCs=${baseCs}`);
+  }
+
+  private applyCheapFilters(changes: PlasticChange[]): PlasticChange[] {
+    const cfg = vscode.workspace.getConfiguration('plasticDiff');
+    let result = changes;
+
+    if (cfg.get<boolean>('hidePureRenames', true)) {
+      const before = result.length;
+      result = result.filter(c => !(c.status === ChangeStatus.Moved && !c.contentChanged));
+      logDiag(`[refresh] pure-rename: ${result.length} kept, ${before - result.length} dropped`);
+    }
+
+    if (cfg.get<boolean>('hideMetaFiles', true)) {
+      const before = result.length;
+      result = result.filter(c => !c.path.toLowerCase().endsWith('.meta'));
+      logDiag(`[refresh] meta: ${result.length} kept, ${before - result.length} dropped`);
+    }
+
+    return result;
   }
 
   private buildMultiDiffFingerprint(snap: typeof this.lastSnapshot): string {
@@ -407,62 +330,15 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
     return true;
   }
 
-  private activeMultiDiffRevealTarget(snap: typeof this.lastSnapshot): MultiDiffRevealTarget | undefined {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-      return undefined;
-    }
-
-    const { uri } = editor.document;
-    const { selection } = editor;
-    const range = selection.isEmpty ? undefined : new vscode.Range(selection.start, selection.end);
-    if (uri.scheme === 'file') {
-      return { modifiedUri: uri, range };
-    }
-    if (uri.scheme !== 'plastic') {
-      return undefined;
-    }
-
-    const parsed = parsePlasticUri(uri);
-    const abs = this.absOf(parsed.path);
-    const change = snap.changes.find(c =>
-      this.absOf(c.path) === abs ||
-      (c.oldPath !== undefined && this.absOf(c.oldPath) === abs)
-    );
-    if (!change) {
-      return undefined;
-    }
-
-    return {
-      modifiedUri: this.diffUris(change, `cs:${snap.baseCs}`, null).modifiedUri,
-      range,
-    };
-  }
-
   private async openMultiDiffEditor(
     resources: DiffUris[],
     title: string,
-    reveal?: MultiDiffRevealTarget,
   ): Promise<void> {
     await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', {
       multiDiffSourceUri: this.multiDiffSourceUri,
       title,
       resources,
-      reveal: reveal ? {
-        modifiedUri: reveal.modifiedUri,
-        range: reveal.range,
-      } : undefined,
     });
-  }
-
-  private async reopenActiveMultiDiffToLatest(): Promise<void> {
-    const snap = this.lastSnapshot;
-    const resources = snap.changes.map(c => this.diffUris(c, `cs:${snap.baseCs}`, null));
-    const reveal = this.activeMultiDiffRevealTarget(snap);
-    await this.closeOpenMultiDiffTabs();
-    await this.openMultiDiffEditor(resources, `Plastic SCM: Changes (${snap.branch || 'unknown'})`, reveal);
-    this._multiDiffOpen = true;
-    this.lastOpenedMultiDiffFingerprint = this.buildMultiDiffFingerprint(snap);
   }
 
   // ---------- Path / URI helpers ----------
@@ -628,17 +504,7 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
       await this.refresh();
     }
 
-    // If the current snapshot is still the raw Stage 1 commit (phantoms included),
-    // wait for phantom filter to finish so Multi Diff opens with correct items.
-    // Prefetch is intentionally NOT awaited — in-flight coalescing handles it.
-    if (!this.lastSnapshot.phantomFiltered && this.phantomInflight) {
-      logDiag(`[scm] snapshot not yet phantom-filtered — awaiting phantom stage`);
-      const tWait = Date.now();
-      await this.phantomInflight;
-      logDiag(`[scm] phantom wait: ${Date.now() - tWait}ms`);
-    }
-
-    // Snapshot read once; subsequent writes by prefetch won't affect us.
+    // Snapshot read once so a refresh cannot change the resources mid-open.
     const snap = this.lastSnapshot;
     const tRefresh = Date.now();
 
@@ -798,11 +664,6 @@ export class PlasticScmProvider implements vscode.Disposable, vscode.QuickDiffPr
   private async showFilterQuickPick(): Promise<void> {
     const cfg = vscode.workspace.getConfiguration('plasticDiff');
     const items: Array<vscode.QuickPickItem & { key: string }> = [
-      {
-        key: 'hideTrivialChanges',
-        label: 'Hide Trivial Changes (.cs using/namespace/comment only)',
-        picked: cfg.get<boolean>('hideTrivialChanges', true),
-      },
       {
         key: 'hidePureRenames',
         label: 'Hide Pure Renames (no content change)',
